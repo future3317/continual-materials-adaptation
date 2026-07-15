@@ -18,10 +18,12 @@ import json
 import math
 import os
 import zipfile
+from collections import defaultdict
 from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
+from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Lattice, Structure
 from torch.utils.data import Dataset
 
@@ -136,8 +138,204 @@ def parse_target(value: Any) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Protocol builders
+# Canonical material group splits
 # ---------------------------------------------------------------------------
+
+
+def canonical_material_group_id(structure: Structure) -> str:
+    """Return a stable material group identifier for a structure.
+
+    The identifier is based on the reduced composition formula plus a coarse
+    structural fingerprint (density and volume per atom). It is invariant to
+    primitive/conventional cell choice and to supercell expansion, so a
+    primitive cell and its ``2x2x2`` supercell receive the same group id.
+
+    The fingerprint is intentionally coarse to be fast on large datasets.
+    It prevents cross-year and cross-fidelity leakage for the same material
+    and for near-duplicate relaxations; polymorphs with the same composition
+    and density are grouped conservatively into the same split.
+    """
+    composition = structure.composition
+    formula = composition.reduced_formula
+    density = round(float(structure.density), 3)
+    n_sites = len(structure)
+    vol_per_atom = round(float(structure.volume / n_sites), 3) if n_sites > 0 else 0.0
+    return f"{formula}|rho={density}|vpa={vol_per_atom}"
+
+
+def assign_global_splits(
+    records: list[dict],
+    seed: int,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+) -> list[dict]:
+    """Assign group-disjoint train/val/test splits in place.
+
+    Each record must contain a ``structure`` key. The function computes a
+    canonical ``group_id`` for every record, shuffles the unique material
+    formulas deterministically using ``seed``, assigns each formula to exactly
+    one split, and propagates that split to every record with that formula.
+    Because records that share a canonical group id also share a formula, this
+    guarantees that no group id appears in more than one split.
+
+    Args:
+        records: List of record dicts with a ``structure`` entry.
+        seed: Random seed for formula shuffling.
+        train_frac: Fraction of formulas to assign to train.
+        val_frac: Fraction of formulas to assign to validation.
+
+    Returns:
+        The same ``records`` list with ``group_id`` and ``split`` fields set.
+    """
+    # Compute group ids and ensure every record has a formula.
+    for r in records:
+        r["group_id"] = canonical_material_group_id(r["structure"])
+        if "formula" not in r:
+            r["formula"] = r["structure"].composition.reduced_formula
+
+    # Collect record indices by formula. Using formula as the split unit keeps
+    # the legacy formula-disjoint guarantee while canonical group_id captures
+    # the material identity for audit and cross-year/fidelity consistency.
+    formulas: set[str] = set()
+    for r in records:
+        formulas.add(r["formula"])
+
+    rng = np.random.default_rng(seed)
+    formulas_list = list(formulas)
+    rng.shuffle(formulas_list)
+
+    n = len(formulas_list)
+    n_train = max(1, int(n * train_frac))
+    n_val = max(1, int(n * val_frac))
+    train_formulas = set(formulas_list[:n_train])
+    val_formulas = set(formulas_list[n_train : n_train + n_val])
+    test_formulas = set(formulas_list[n_train + n_val :])
+
+    # Enforce the single-split invariant at the formula level.
+    assert not (train_formulas & val_formulas)
+    assert not (train_formulas & test_formulas)
+    assert not (val_formulas & test_formulas)
+
+    for r in records:
+        f = r["formula"]
+        if f in train_formulas:
+            r["split"] = "train"
+        elif f in val_formulas:
+            r["split"] = "val"
+        else:
+            r["split"] = "test"
+
+    # Sanity check: no canonical group id appears in multiple splits.
+    groups_by_split: dict[str, set[str]] = defaultdict(set)
+    for r in records:
+        groups_by_split[r["split"]].add(r["group_id"])
+    assert not (groups_by_split["train"] & groups_by_split["val"])
+    assert not (groups_by_split["train"] & groups_by_split["test"])
+    assert not (groups_by_split["val"] & groups_by_split["test"])
+
+    return records
+
+
+def _coarse_structure_signature_from_record(record: dict) -> str:
+    """Return a cheap structural signature directly from a JARVIS raw record.
+
+    This avoids building a pymatgen ``Structure`` and is used only for the
+    revision audit pre-filter. It combines the reduced composition, number of
+    sites, and the volume per atom.
+    """
+    from math import gcd
+    from functools import reduce
+
+    atoms = record["atoms"]
+    counts: dict[str, int] = {}
+    for el in atoms["elements"]:
+        counts[el] = counts.get(el, 0) + 1
+
+    vals = list(counts.values())
+    if vals:
+        g = reduce(gcd, vals)
+        reduced = {el: c // g for el, c in counts.items()}
+    else:
+        reduced = counts
+
+    formula = "".join(f"{el}{reduced[el]}" for el in sorted(reduced))
+    lattice = np.array(atoms["lattice_mat"], dtype=float)
+    volume = abs(float(np.linalg.det(lattice)))
+    n_sites = len(atoms["elements"])
+    vpa = round(volume / n_sites, 3)
+    return f"{formula}|n={n_sites}|vpa={vpa}"
+
+
+def _compute_protocol_b_revision_audit(
+    d21: list[dict],
+    d22: list[dict],
+) -> dict[str, int]:
+    """Count database revisions between the 2021 and 2022 JARVIS snapshots.
+
+    Reports:
+      * ``unchanged_jids``: retained JIDs with matching structure and targets.
+      * ``new_jids``: JIDs present only in 2022.
+      * ``revised_structures``: retained JIDs whose structure changed.
+      * ``revised_targets``: retained JIDs with unchanged structure but
+        changed band-gap targets (OptB88vdW or TB-mBJ).
+
+    The structural comparison first uses a cheap raw-record signature; only
+    when that signature differs does it fall back to ``StructureMatcher``.
+    """
+    # Use first occurrence to handle the handful of duplicate JIDs in 2021.
+    jid_to_2021: dict[str, dict] = {}
+    for r in d21:
+        if r["jid"] not in jid_to_2021:
+            jid_to_2021[r["jid"]] = r
+    jid_to_2022 = {r["jid"]: r for r in d22}
+
+    retained_jids = set(jid_to_2021.keys()) & set(jid_to_2022.keys())
+    new_jids = set(jid_to_2022.keys()) - set(jid_to_2021.keys())
+
+    unchanged = 0
+    revised_structures = 0
+    revised_targets = 0
+    sm = StructureMatcher()
+
+    for jid in retained_jids:
+        r21 = jid_to_2021[jid]
+        r22 = jid_to_2022[jid]
+
+        target_changed = False
+        for field in ("optb88vdw_bandgap", "mbj_bandgap"):
+            v21 = parse_target(r21.get(field))
+            v22 = parse_target(r22.get(field))
+            if (v21 is None) != (v22 is None):
+                target_changed = True
+                break
+            if v21 is not None and v22 is not None and abs(v21 - v22) > 1e-6:
+                target_changed = True
+                break
+
+        sig21 = _coarse_structure_signature_from_record(r21)
+        sig22 = _coarse_structure_signature_from_record(r22)
+
+        if sig21 != sig22:
+            # Fall back to StructureMatcher only for suspicious pairs.
+            s21 = jarvis_record_to_structure(r21)
+            s22 = jarvis_record_to_structure(r22)
+            struct_changed = not sm.fit(s21, s22)
+        else:
+            struct_changed = False
+
+        if struct_changed:
+            revised_structures += 1
+        if target_changed:
+            revised_targets += 1
+        if not struct_changed and not target_changed:
+            unchanged += 1
+
+    return {
+        "unchanged_jids": unchanged,
+        "new_jids": len(new_jids),
+        "revised_structures": revised_structures,
+        "revised_targets": revised_targets,
+    }
 
 
 def _has_targets(record: dict, fields: Sequence[str]) -> bool:
@@ -206,6 +404,7 @@ def build_protocol_a(
     cache_dir: str | None = None,
     seed: int = 42,
     n_train_val_per_task: int | None = None,
+    global_split: bool = False,
 ) -> tuple[list[tuple[str, str, str]], list[list[dict]], dict]:
     """Build Protocol A: data-incremental JARVIS database evolution.
 
@@ -217,8 +416,12 @@ def build_protocol_a(
 
     A2 and A4 are restricted to JIDs that do not appear in the 2021 snapshot,
     so A1 -> A2 is a true data-incremental expansion of the formation-energy
-    task, and A3 -> A4 is the same for band gap.  Each task is split
-    formula-disjointly into train/val/test.
+    task, and A3 -> A4 is the same for band gap.
+
+    By default each task is split formula-disjointly. Setting
+    ``global_split=True`` assigns a single canonical material-group split
+    across all four tasks, so the same material (and the same JID when it
+    appears in multiple tasks) always falls in the same partition.
 
     Args:
         cache_dir: JARVIS cache directory.
@@ -226,6 +429,8 @@ def build_protocol_a(
         n_train_val_per_task: If given, cap each task to this many records
             (useful for fast smoke tests).  Cap applies after the "added"
             filter and before splitting.
+        global_split: If True, use one canonical material-group split shared
+            across all tasks. Default False preserves legacy behavior.
 
     Returns:
         tasks: List of ``(dataset, property, fidelity)`` task descriptors.
@@ -266,11 +471,15 @@ def build_protocol_a(
         a3 = a3[:n_train_val_per_task]
         a4 = a4[:n_train_val_per_task]
 
-    # Formula-disjoint splits per task.
-    a1 = _assign_splits(a1, seed=seed)
-    a2 = _assign_splits(a2, seed=seed + 1)
-    a3 = _assign_splits(a3, seed=seed + 2)
-    a4 = _assign_splits(a4, seed=seed + 3)
+    if global_split:
+        # Single canonical material-group split across all four tasks.
+        assign_global_splits(a1 + a2 + a3 + a4, seed=seed)
+    else:
+        # Legacy formula-disjoint splits per task.
+        a1 = _assign_splits(a1, seed=seed)
+        a2 = _assign_splits(a2, seed=seed + 1)
+        a3 = _assign_splits(a3, seed=seed + 2)
+        a4 = _assign_splits(a4, seed=seed + 3)
 
     tasks = [
         ("dft_3d_2021", "formation_energy", "OptB88vdW"),
@@ -367,29 +576,12 @@ def build_protocol_b(
     opt_21, mbj_21 = pair_bandgaps(d21, "dft_3d_2021")
     opt_22, mbj_22 = pair_bandgaps(d22, "dft_3d")
 
-    # Assign splits jointly by formula so OPT/MBJ pairs stay together.
-    def assign_paired_splits(opt_recs: list[dict], mbj_recs: list[dict], seed: int) -> None:
-        rng = np.random.default_rng(seed)
-        formulas = list({r["formula"] for r in opt_recs})
-        rng.shuffle(formulas)
-        n = len(formulas)
-        n_train = max(1, int(n * 0.70))
-        n_val = max(1, int(n * 0.15))
-        train_formulas = set(formulas[:n_train])
-        val_formulas = set(formulas[n_train : n_train + n_val])
-        test_formulas = set(formulas[n_train + n_val :])
-
-        for r in opt_recs + mbj_recs:
-            f = r["formula"]
-            if f in train_formulas:
-                r["split"] = "train"
-            elif f in val_formulas:
-                r["split"] = "val"
-            else:
-                r["split"] = "test"
-
-    assign_paired_splits(opt_21, mbj_21, seed=seed)
-    assign_paired_splits(opt_22, mbj_22, seed=seed + 1)
+    # Assign a single global group-disjoint split across all four task/fidelity
+    # views. Because OPT/MBJ records for the same JID share the same structure,
+    # they automatically receive the same group_id and therefore the same split.
+    # Likewise, a material present in both 2021 and 2022 keeps the same split.
+    all_records = opt_21 + mbj_21 + opt_22 + mbj_22
+    assign_global_splits(all_records, seed=seed)
 
     # Optional cap applied per fidelity.
     if n_train_val_per_task is not None:
@@ -426,6 +618,7 @@ def build_protocol_b(
         "task_b3": split_counts(opt_22),
         "task_b4": split_counts(mbj_22),
     }
+    audit.update(_compute_protocol_b_revision_audit(d21, d22))
 
     # Assert shared partitions for paired records.
     for opt_recs, mbj_recs in [(opt_21, mbj_21), (opt_22, mbj_22)]:
@@ -433,6 +626,16 @@ def build_protocol_b(
         for r in mbj_recs:
             assert r["jid"] in opt_map
             assert opt_map[r["jid"]] == r["split"]
+
+    # Assert global group-disjointness: no group_id may appear in two splits
+    # across the four task/fidelity views.
+    groups_by_split: dict[str, set[str]] = defaultdict(set)
+    for recs in task_records:
+        for r in recs:
+            groups_by_split[r["split"]].add(r["group_id"])
+    assert not (groups_by_split["train"] & groups_by_split["val"])
+    assert not (groups_by_split["train"] & groups_by_split["test"])
+    assert not (groups_by_split["val"] & groups_by_split["test"])
 
     return tasks, task_records, audit
 
