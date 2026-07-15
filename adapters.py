@@ -109,40 +109,21 @@ class LoRAABAAdapter(ResidualAdapter):
         return self.d_in * self.rank + self.rank * self.rank + self.d_out * self.rank
 
 
-class SingleChildTuckerAdapter(ResidualAdapter):
+class SingleChildTuckerAdapter(LoRAABAAdapter):
     """Tucker-style residual for a *single* (property, fidelity) child.
 
     When there is only one new fidelity the property and fidelity Tucker modes
     do not provide cross-task sharing; keeping a full 4D Tucker core is
-    redundant and makes parameter accounting inconsistent with the theory.  This
-    adapter keeps the Tucker *name* but implements the minimal form
-    ``U_out @ M @ U_in^T``, identical in function to ``LoRAABAAdapter`` but
-    initialized with a Tucker-style core.
+    redundant and makes parameter accounting inconsistent with the theory.
+    This class is therefore a semantic alias for ``LoRAABAAdapter``:
+    ``U_out @ M @ U_in^T``.  Using it in the registry makes it explicit that we
+    are *not* claiming multi-axis Tucker sharing in the single-child regime.
 
     This directly addresses 反馈_2.md 2.3 (Tucker degeneration) and 2.2
     (parameter-count mismatch).
     """
 
-    def __init__(self, d_in: int, d_out: int, rank: int) -> None:
-        super().__init__()
-        self.d_in = d_in
-        self.d_out = d_out
-        self.rank = rank
-        self.u_in = nn.Parameter(torch.empty(d_in, rank))
-        self.core = nn.Parameter(torch.empty(rank, rank))
-        self.u_out = nn.Parameter(torch.empty(d_out, rank))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.u_in, a=5 ** (1.0 / 3))
-        nn.init.orthogonal_(self.core)
-        nn.init.zeros_(self.u_out)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _apply_linear_chain(x, self.u_in.t(), self.core, self.u_out)
-
-    def incremental_parameter_count(self) -> int:
-        return self.d_in * self.rank + self.rank * self.rank + self.d_out * self.rank
+    pass
 
 
 class MultiAxisTuckerAdapter(ResidualAdapter):

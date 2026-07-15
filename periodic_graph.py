@@ -175,11 +175,32 @@ def to_dense_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert a sparse periodic graph to the dense padded format.
 
+    .. warning::
+
+        This function exists only for backward compatibility with models that
+        consume dense padded tensors (e.g. the default EGNN encoder).  The
+        returned ``coords`` matrix contains only the unit-cell atom positions;
+        it does **not** encode the periodic lattice shifts stored in
+        ``graph['edge_shifts']``.  Consequently, a dense EGNN that recomputes
+        distances from ``coords`` will *not* see the correct periodic
+        displacements.  For crystal-aware encoding, use a sparse-graph backbone
+        (MatGL/ALIGNN) with :meth:`forward` on the sparse graph dict.
+
     Returns:
         ``(node_feats, coords, mask, original_mask)`` compatible with
         ``models.ContinualCrystalModel``.  Because the sparse graph only stores
         unit-cell atoms, ``original_mask`` is all-``True``.
     """
+    import warnings
+
+    warnings.warn(
+        "to_dense_tensors drops periodic lattice shifts; the dense EGNN path "
+        "does not enforce periodic boundary conditions. Use a sparse-graph "
+        "backbone (MatGL/ALIGNN) for crystal-aware encoding.",
+        UserWarning,
+        stacklevel=2,
+    )
+
     node_feats = graph["node_feats"]
     coords = graph["coords"]
     n = node_feats.size(0)

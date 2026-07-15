@@ -71,20 +71,48 @@ def test_adapter_parameter_count_matches_formula():
 
 
 def test_single_child_tucker_matches_lora_aba():
-    """With identical weights, single-child Tucker and LoRA-ABA are numerically identical."""
+    """SingleChildTuckerAdapter is a semantic alias for LoRAABAAdapter."""
     d_in, d_out, rank = 16, 16, 4
     tucker = SingleChildTuckerAdapter(d_in, d_out, rank)
     aba = LoRAABAAdapter(d_in, d_out, rank)
-    aba.u_in.data = tucker.u_in.data.clone()
-    aba.middle.data = tucker.core.data.clone()
-    aba.u_out.data = tucker.u_out.data.clone()
+    assert isinstance(tucker, LoRAABAAdapter)
 
-    x = torch.randn(3, d_in)
-    torch.manual_seed(0)
+    # With identical weights, outputs and gradients must match.
+    tucker.u_in.data = aba.u_in.data.clone()
+    tucker.middle.data = aba.middle.data.clone()
+    tucker.u_out.data = aba.u_out.data.clone()
+
+    x = torch.randn(3, d_in, requires_grad=True)
     out_t = tucker(x)
-    torch.manual_seed(0)
     out_a = aba(x)
     assert torch.allclose(out_t, out_a, atol=1e-6)
+
+    out_t.sum().backward()
+    grad_t = x.grad.clone()
+    x.grad = None
+    out_a.sum().backward()
+    grad_a = x.grad.clone()
+    assert torch.allclose(grad_t, grad_a, atol=1e-6)
+
+
+def test_single_child_parameter_formula_3329():
+    """Default single-child config must match L(2dr + r^2) + (d + 1) = 3329."""
+    from models import ContinualCrystalModel
+
+    model = ContinualCrystalModel(
+        node_dim=92,
+        hidden_dim=64,
+        n_properties=1,
+        n_fidelities=2,
+        adapter_name="single_child_tucker",
+        adapter_rank=8,
+        n_layers=3,
+        num_nearest_neighbors=8,
+    )
+    model.add_task(0, 0)
+    count = model.count_task_parameters(0, 0)
+    expected = 3 * (2 * 64 * 8 + 8 * 8) + (64 + 1)
+    assert count == expected == 3329, f"expected {expected}, got {count}"
 
 
 def test_no_dxd_materialization():
