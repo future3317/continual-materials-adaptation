@@ -413,6 +413,7 @@ def _run_label_and_metrics(
 
     return {
         "experiment": label,
+        "model": model,
         "nmaes": nmaes,
         "task1_after_task1": task1_after_t1,
         "task1_after_task2": task1_after_t2,
@@ -1227,7 +1228,7 @@ def d6d_parameter_matched_mlp_residual(
         hidden_dim,
         device,
         base_state_dict,
-        correction=correction,
+        correction_module=correction,
         label="fr_phytca_param_matched_mlp",
         epochs=epochs,
         batch_size=batch_size,
@@ -1353,7 +1354,7 @@ def d6h_matched_mlp_residual(
         hidden_dim,
         device,
         base_state_dict,
-        correction=correction,
+        correction_module=correction,
         label="matched_mlp_residual",
         epochs=epochs,
         batch_size=batch_size,

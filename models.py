@@ -18,6 +18,7 @@ recipe.
 
 from __future__ import annotations
 
+import copy
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -26,6 +27,26 @@ import torch.nn.functional as F
 from egnn_pytorch import EGNN
 
 from adapters import ResidualAdapter, make_adapter_bank
+
+
+class CopyOnWriteTopBlock(nn.Module):
+    """Private child copy of the top encoder layer.
+
+    Implements the copy-on-write top block baseline from 反馈_2.md 4.3:
+    the parent route keeps using the original frozen top EGNN layer, while a
+    new high-fidelity child receives a deep copy of that layer that is trained
+    independently.  Because the parent layer is never updated, exact retention
+    of the parent route is preserved.
+    """
+
+    def __init__(self, top_layer: EGNN) -> None:
+        super().__init__()
+        self.child_layer = copy.deepcopy(top_layer)
+
+    def forward(
+        self, h: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.child_layer(h, coords, mask=mask)
 
 
 class CrystalEncoder(nn.Module):
@@ -75,6 +96,7 @@ class CrystalEncoder(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
         adapter_bank: Optional[Sequence[ResidualAdapter]] = None,
+        private_top_block: Optional[CopyOnWriteTopBlock] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode crystal to node features.
 
@@ -83,13 +105,18 @@ class CrystalEncoder(nn.Module):
             coords: (B, N, 3)
             mask: (B, N) bool padding mask.
             adapter_bank: optional list of adapters, one per layer.
+            private_top_block: optional child-private copy of the top EGNN layer.
 
         Returns:
             (h, coords) where ``h`` has shape (B, N, hidden_dim).
         """
         h = self.node_embed(node_feats)
+        n_layers = len(self.layers)
         for i, layer in enumerate(self.layers):
-            h, coords = layer(h, coords, mask=mask)
+            if i == n_layers - 1 and private_top_block is not None:
+                h, coords = private_top_block(h, coords, mask)
+            else:
+                h, coords = layer(h, coords, mask=mask)
             if adapter_bank is not None:
                 adapter = adapter_bank[i]
                 h = h + adapter(h)
@@ -101,9 +128,10 @@ class CrystalEncoder(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
         adapter_bank: Optional[Sequence[ResidualAdapter]] = None,
+        private_top_block: Optional[CopyOnWriteTopBlock] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Alias for ``forward``; kept for a uniform encoder interface."""
-        return self.forward(node_feats, coords, mask, adapter_bank)
+        return self.forward(node_feats, coords, mask, adapter_bank, private_top_block)
 
 
 class ContinualCrystalModel(nn.Module):
@@ -162,6 +190,8 @@ class ContinualCrystalModel(nn.Module):
         self.heads: Dict[str, nn.Linear] = nn.ModuleDict()
         # Per-task adapter banks.
         self.adapter_banks: Dict[str, nn.ModuleList] = nn.ModuleDict()
+        # Per-task private top encoder blocks (copy-on-write baseline).
+        self.private_top_blocks: Dict[str, CopyOnWriteTopBlock] = nn.ModuleDict()
         self._task_order: List[Tuple[int, int]] = []
         self._frozen_tasks: set[str] = set()
 
@@ -196,7 +226,7 @@ class ContinualCrystalModel(nn.Module):
         return key
 
     def freeze_task(self, prop_id: int, fid_id: int) -> None:
-        """Freeze the adapter bank and head for a completed task."""
+        """Freeze the adapter bank, head, and optional private top block for a completed task."""
         key = self._task_key(prop_id, fid_id)
         self._frozen_tasks.add(key)
         if key in self.heads:
@@ -206,6 +236,26 @@ class ContinualCrystalModel(nn.Module):
             for adapter in self.adapter_banks[key]:
                 for p in adapter.parameters():
                     p.requires_grad = False
+        if key in self.private_top_blocks:
+            for p in self.private_top_blocks[key].parameters():
+                p.requires_grad = False
+
+    def add_private_top_block(self, prop_id: int, fid_id: int) -> str:
+        """Attach a child-private copy of the top encoder layer to a task.
+
+        The task must already have an adapter bank/head allocated.  The private
+        top block is trainable by default and is frozen together with the task
+        when ``freeze_task`` is called.
+        """
+        key = self._task_key(prop_id, fid_id)
+        if key not in self.heads:
+            raise RuntimeError(f"Task {key} does not exist; call add_task first.")
+        if key not in self.private_top_blocks:
+            if not hasattr(self.encoder, "layers") or not self.encoder.layers:
+                raise RuntimeError("Encoder has no layers to copy for private top block.")
+            top_layer = self.encoder.layers[-1]
+            self.private_top_blocks[key] = CopyOnWriteTopBlock(top_layer)
+        return key
 
     def is_frozen(self, prop_id: int, fid_id: int) -> bool:
         return self._task_key(prop_id, fid_id) in self._frozen_tasks
@@ -234,7 +284,8 @@ class ContinualCrystalModel(nn.Module):
         """Return pooled crystal-level representation for a task."""
         key = self._task_key(prop_id, fid_id)
         bank = self.adapter_banks[key] if key in self.adapter_banks else None
-        h, _ = self.encoder.encode(node_feats, coords, mask, adapter_bank=bank)
+        top_block = self.private_top_blocks[key] if key in self.private_top_blocks else None
+        h, _ = self.encoder.encode(node_feats, coords, mask, adapter_bank=bank, private_top_block=top_block)
         mask_exp = original_mask.unsqueeze(-1).float()
         pooled = (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1).clamp_min(1.0))
         return pooled
@@ -266,7 +317,7 @@ class ContinualCrystalModel(nn.Module):
         return sum(p.numel() for p in self.encoder.parameters())
 
     def count_task_parameters(self, prop_id: int, fid_id: int) -> int:
-        """Parameters belonging to one task (head + its adapter bank)."""
+        """Parameters belonging to one task (head + its adapter bank + private top block)."""
         key = self._task_key(prop_id, fid_id)
         total = 0
         if key in self.heads:
@@ -274,6 +325,8 @@ class ContinualCrystalModel(nn.Module):
         if key in self.adapter_banks:
             for adapter in self.adapter_banks[key]:
                 total += adapter.incremental_parameter_count()
+        if key in self.private_top_blocks:
+            total += sum(p.numel() for p in self.private_top_blocks[key].parameters())
         return total
 
     def count_incremental_parameters(self, prop_id: int, fid_id: int) -> int:
@@ -284,18 +337,23 @@ class ContinualCrystalModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def get_parameter_group_counts(self) -> Dict[str, int]:
-        """Return encoder / adapters / heads breakdown."""
+        """Return encoder / adapters / heads / private top blocks breakdown."""
         encoder = self.count_encoder_parameters()
         heads = sum(sum(p.numel() for p in h.parameters()) for h in self.heads.values())
         adapters = 0
         for bank in self.adapter_banks.values():
             for adapter in bank:
                 adapters += adapter.incremental_parameter_count()
+        private_tops = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in self.private_top_blocks.values()
+        )
         return {
             "total": self.count_total_parameters(),
             "encoder": encoder,
             "adapters": adapters,
             "heads": heads,
+            "private_top_blocks": private_tops,
         }
 
     def load_parent_checkpoint(

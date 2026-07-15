@@ -179,6 +179,7 @@ class MatGLBackbone(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
         adapter_bank: Optional[Sequence[nn.Module]] = None,
+        private_top_block: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode dense padded tensors to node features.
 
@@ -193,10 +194,13 @@ class MatGLBackbone(nn.Module):
             mask: ``(B, N)`` bool padding mask; ``True`` marks real atoms.
             adapter_bank: Ignored; retained for signature compatibility with
                 ``CrystalEncoder.forward``.
-
+            private_top_block: Ignored; retained for signature compatibility with
+                ``CrystalEncoder.forward``. Copy-on-write top blocks are only
+                supported by the default EGNN encoder.
         Returns:
             ``(h, coords)`` where ``h`` has shape ``(B, N, hidden_dim)``.
         """
+        _ = private_top_block  # not applicable to MatGL-backed encoders
         B, N, _ = node_feats.shape
         device = node_feats.device
         dtype = coords.dtype
@@ -455,8 +459,22 @@ class ALIGNNBackbone(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
         adapter_bank: Optional[Sequence[nn.Module]] = None,
+        private_top_block: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode dense padded tensors to node features (molecule-like kNN path)."""
+        """Encode dense padded tensors to node features (molecule-like kNN path).
+
+        Args:
+            node_feats: ``(B, N, node_dim)`` one-hot / embedding node features.
+            coords: ``(B, N, 3)`` Cartesian coordinates.
+            mask: ``(B, N)`` bool padding mask; ``True`` marks real atoms.
+            adapter_bank: Ignored; retained for signature compatibility.
+            private_top_block: Ignored; retained for signature compatibility with
+                ``CrystalEncoder.forward``. Copy-on-write top blocks are only
+                supported by the default EGNN encoder.
+        Returns:
+            ``(h, coords)`` where ``h`` has shape ``(B, N, hidden_dim)``.
+        """
+        _ = private_top_block  # not applicable to ALIGNN-backed encoders
         B, N, _ = node_feats.shape
         device = node_feats.device
         dtype = coords.dtype
