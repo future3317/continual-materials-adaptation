@@ -1,0 +1,291 @@
+%%%%%%%% ICLR 2027 SUBMISSION FILE (content; compile with icml2025 package for now) %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{enumitem}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\providecommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2025}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Exact-Retention Continual Multi-Fidelity Adaptation for Materials}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Exact-Retention Continual Multi-Fidelity Adaptation\\
+           for Materials Property Prediction}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Firstname1 Lastname1}{equal,yyy}
+\icmlauthor{Firstname2 Lastname2}{equal,yyy,comp}
+\icmlauthor{Firstname3 Lastname3}{comp}
+\icmlauthor{Firstname4 Lastname4}{sch}
+\icmlauthor{Firstname5 Lastname5}{yyy}
+\icmlauthor{Firstname6 Lastname6}{sch,yyy,comp}
+\icmlauthor{Firstname7 Lastname7}{comp}
+\icmlauthor{Firstname8 Lastname8}{sch}
+\icmlauthor{Firstname8 Lastname8}{yyy,comp}
+\end{icmlauthorlist}
+
+\icmlaffiliation{yyy}{Department of XXX, University of YYY, Location, Country}
+\icmlaffiliation{comp}{Company Name, Location, Country}
+\icmlaffiliation{sch}{School of ZZZ, Institute of WWW, Location, Country}
+
+\icmlcorrespondingauthor{Firstname1 Lastname1}{first1.last1@xxx.edu}
+\icmlcorrespondingauthor{Firstname2 Lastname2}{first2.last2@www.uk}
+
+\icmlkeywords{Continual Learning, Materials Informatics, Multi-Fidelity Learning, Catastrophic Forgetting, Parameter-Efficient Adaptation}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{\icmlEqualContribution}
+
+\begin{abstract}
+Materials databases such as the Materials Project and JARVIS evolve continuously: new materials are added, revised calculations replace older estimates, and multiple density-functionals offer competing fidelity levels for the same quantity. We study continual learning for such databases under the constraint that previously deployed models must not change. We propose a \textbf{Fidelity-Residual (FR)} framework that learns a parent model on a cheap, abundant fidelity and then freezes it permanently. Each higher fidelity is learned as a small prediction residual on top of the frozen parent, so the parent route is exactly invariant by construction and forgetting is identically zero. The residual can be parameterized by a low-rank adapter; in the single-child regime this is equivalent to a LoRA-ABA form, while a multi-axis Tucker parameterization becomes meaningful only when several properties or fidelities share factors. We prove parent-route invariance, give a closed-form incremental parameter count, and replace the previous incorrect fidelity-error lower-bound with a prediction-residual identity. We validate the framework on JARVIS multi-fidelity band-gap learning with global canonical material-group splits that prevent cross-year leakage, and we integrate MatGL and ALIGNN backbones. Code, data splits, and the decisive experiment script are available at \url{https://github.com/future3317/continual-materials-adaptation}.
+\end{abstract}
+
+\section{Introduction}
+
+Machine-learning models for materials property prediction are increasingly trained on large compositional databases \cite{jain2013materials, choudhary2020joint}. In practice, however, these databases are not static: the Materials Project (MP) and JARVIS release new versions with tens of thousands of additional structures, revised energies, and expanded property sets; different density functionals (PBE, OptB88vdW, TB-mBJ) offer competing fidelity levels for the same quantity; and new characterization techniques add properties such as dielectric, elastic, and piezoelectric tensors. Retraining a model from scratch after every update is expensive and environmentally costly, while naively fine-tuning on new data causes catastrophic forgetting of previously learned chemistry.
+
+Continual learning (CL) offers a natural paradigm, but most CL methods are designed for image classification with clear task boundaries and task-specific heads \cite{kirkpatrick2017overcoming, chaudhry2018riemannian}. Materials databases pose additional challenges:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{No database-version identity at inference.} A deployed model sees a crystal and must predict a property and fidelity (e.g., band gap / TB-mBJ); it does not know whether the crystal came from JARVIS-2021 or JARVIS-2022.
+    \item \textbf{Multiple coupled axes of change.} Evolution occurs along materials, properties, and fidelities simultaneously.
+    \item \textbf{Exact retention requirement.} Once a model is used in downstream screening or published, its previous predictions must not drift when new data arrive.
+\end{enumerate}
+
+We address these challenges with an \textbf{Exact-Retention Fidelity-Residual (FR)} framework. The central idea is to exploit the natural hierarchy of computational fidelities: low-fidelity calculations are cheap and abundant, while high-fidelity calculations are expensive and scarce. The framework first learns a \emph{parent} model on the low-fidelity data and then freezes its effective route. Each higher fidelity is learned as a small residual on top of the frozen parent, so old predictions are never perturbed. When several properties or fidelities are available, the residuals can share a Tucker factorization; for the common single-fidelity adaptation case, the residual reduces to a low-rank adapter with a trainable middle matrix.
+
+\textbf{Contributions.}
+\begin{itemize}[leftmargin=*]
+    \item We formulate continual learning for materials databases as adaptation along database version, property, and fidelity axes, and we identify that exact retention is a stronger and more scientifically relevant guarantee than approximate stability.
+    \item We propose an exact-retention FR framework that freezes a parent fidelity route and learns higher-fidelity residuals, guaranteeing zero forgetting for the parent task by structural isolation rather than by gradient anchoring.
+    \item We prove parent-route invariance and a closed-form incremental parameter count, and we correct the previous fidelity-error analysis to a prediction-residual identity.
+    \item We implement global canonical material-group splits that prevent leakage across JARVIS versions and fidelities, and we integrate MatGL and ALIGNN backbones. We report diagnostic evidence and describe the decisive single-snapshot Protocol~B experiment used to position the method.
+\end{itemize}
+
+\section{Methods}
+
+\subsection{Problem formulation}
+
+A crystal $x$ is represented as a periodic graph. A \emph{fidelity graph} $G=(V,E)$ has vertices $v=(p,f)$ indexed by property $p$ and fidelity $f$, and directed edges $u\to v$ indicating that fidelity $v$ can be predicted from fidelity $u$ via a residual correction. At training time, fidelities arrive sequentially; at inference time, the queried property and fidelity are known, but no database-version or snapshot identifier is provided.
+
+For a parent fidelity $L$ and a child fidelity $H$, the FR predictor is
+\begin{equation}
+\hat y_H(x) = \hat y_L(x) + \delta_\phi(x),
+\label{eq:fr-predictor}
+\end{equation}
+where $\hat y_L$ is produced by a frozen parent route and $\delta_\phi$ is a learnable child residual. The child is trained on the prediction residual
+\begin{equation}
+q_H(x) = y_H(x) - \hat y_L(x).
+\label{eq:prediction-residual}
+\end{equation}
+This differs from classical $\Delta$-learning, which regresses $y_H-y_L$ and requires paired low-fidelity labels. The prediction-residual target $q_H$ needs only the frozen parent's prediction on the high-fidelity structure, so unpaired high-fidelity data can be used.
+
+\subsection{Exact-retention residual adapter}
+
+The residual operates on the hidden representation produced by a frozen crystal-graph encoder. For a layer with hidden dimension $d$, the single-child residual adapter has the form
+\begin{equation}
+\Delta \mathbf W = \mathbf U_{\mathrm{out}} \mathbf M \mathbf U_{\mathrm{in}}^{\!\top},
+\qquad
+\mathbf U_{\mathrm{in}},\mathbf U_{\mathrm{out}}\in\mathbb R^{d\times r},
+\;\mathbf M\in\mathbb R^{r\times r},
+\label{eq:single-child-adapter}
+\end{equation}
+which is applied to hidden features as $\delta_\phi(\mathbf H)=\mathbf H\,\mathbf U_{\mathrm{in}}\mathbf M^{\!\top}\mathbf U_{\mathrm{out}}^{\!\top}$. This is the LoRA-ABA parameterization and is functionally equivalent to the single-child Tucker adapter used in our initial experiments. It is not a multi-axis Tucker decomposition: for a single new fidelity the property and fidelity Tucker modes have nothing to share, and maintaining a full 4D core only obscures parameter accounting.
+
+When several properties or fidelities are adapted simultaneously, the residuals can be factorized across axes via a Tucker core:
+\begin{equation}
+\mathcal A = \mathcal G \times_1 \mathbf U_{\mathrm{out}} \times_2 \mathbf U_{\mathrm{in}} \times_3 \mathbf E_{\mathrm{prop}} \times_4 \mathbf E_{\mathrm{fidelity}},
+\end{equation}
+with per-task slice
+\begin{equation}
+\Delta \mathbf W_{p,f} = \mathbf U_{\mathrm{out}} \bigl(\mathcal G \times_3 \mathbf e_p \times_4 \mathbf e_f\bigr) \mathbf U_{\mathrm{in}}^{\!\top}.
+\end{equation}
+This multi-axis form is meaningful only when $N_p\ge 2$ or $N_f\ge 3$ so that the property/fidelity modes are actually shared.
+
+\subsection{Structural isolation and exact retention}
+
+Parent-route invariance is achieved by structural isolation, not by zeroing gradients. The parent route (frozen encoder, parent adapter bank, parent head) is stored in a separate parameter group; the child optimizer receives only child parameters. Consequently:
+\begin{itemize}[leftmargin=*]
+    \item Adam momentum and weight decay never touch parent parameters.
+    \item No gradient hook or per-step mask is needed.
+    \item Exact retention holds in mixed precision, with dropout disabled, and with deterministic normalization.
+\end{itemize}
+
+\subsection{Copy-on-write representation adaptation}
+
+If a low-rank residual is insufficient, the framework can copy the top encoder layer for the child while leaving the parent layer untouched. The child then uses its private copy of the top layer, and the parent continues to use the original. This is still exact retention because the parent's parameters are never modified. We include copy-on-write top block as a baseline in the decisive experiments.
+
+\subsection{Normalization}
+
+Each fidelity is normalized by its own training-set mean and standard deviation. The model predicts child-normalized targets directly; no parent and child normalized quantities are added. Correction baselines that explicitly add parent prediction and residual use a \texttt{PredictionResidualHead} that converts the parent prediction to physical units, adds the learned physical residual, and re-normalizes to the child space.
+
+\subsection{Optimization objective}
+
+For the FR child, only the residual adapter and the new fidelity head are trainable:
+\begin{equation}
+\mathcal L_H = \frac{1}{|\mathcal D_H|} \sum_{(x,y_H)\in\mathcal D_H} \bigl(y_H - \hat y_L(x) - \delta_\phi(x)\bigr)^2 + \lambda_{\mathrm{decay}}\|\phi\|_2^2.
+\label{eq:child-loss}
+\end{equation}
+Because the parent route is frozen, no stability coefficient needs to be tuned.
+
+\section{Theoretical Analysis}
+
+\begin{theorem}[Parent-route invariance]
+\label{thm:invariance}
+Let $\Theta_P$ be the set of parent-route parameters after training the parent task. Suppose the child task is trained with an optimizer whose parameter set is disjoint from $\Theta_P$. Then for every input crystal $x$,
+\begin{equation}
+f_L\bigl(x; \Theta^{(t+1)}\bigr) = f_L\bigl(x; \Theta^{(t)}\bigr),
+\end{equation}
+and the absolute forgetting on the parent task is exactly zero.
+\end{theorem}
+
+\begin{proof}
+The parent forward pass depends only on $\Theta_P$. Because the optimizer updates no parameter in $\Theta_P$ and no child module is shared with the parent route, the parent mapping is unchanged.
+\end{proof}
+
+\begin{proposition}[Incremental parameter count]
+\label{prop:growth}
+Consider $L$ crystal-graph layers with hidden dimension $d$ and child rank $r$. Adding one new fidelity as a single-child residual adapter requires
+\begin{equation}
+\Delta P_{\mathrm{fid}} = L\bigl(2dr + r^2\bigr) + (d+1)
+\end{equation}
+additional trainable parameters, where the final $d+1$ term is the new fidelity head (weight plus bias). The growth is linear in rank and independent of the number of previous fidelities.
+\end{proposition}
+
+\begin{proof}
+Each layer contributes $\mathbf U_{\mathrm{in}}$ ($dr$), $\mathbf U_{\mathrm{out}}$ ($dr$), and $\mathbf M$ ($r^2$). The new head contributes $d+1$. No property/fidelity embeddings are added for a single child.
+\end{proof}
+
+For our default configuration $L=3$, $d=64$, $r=8$, this gives $3(2\cdot64\cdot8 + 8^2) + 65 = 3329$ incremental parameters.
+
+\begin{proposition}[Prediction-residual identity]
+\label{prop:residual-identity}
+For any crystal $x$,
+\begin{equation}
+y_H - \hat y_H = q_H - \delta_\phi,
+\end{equation}
+where $q_H = y_H - \hat y_L$ is the prediction-residual target. Consequently,
+\begin{equation}
+|y_H - \hat y_H| = |q_H - \delta_\phi|.
+\end{equation}
+If the child residual perfectly matches the prediction residual ($\delta_\phi = q_H$), the high-fidelity error is zero regardless of the parent error.
+\end{proposition}
+
+\begin{proof}
+Substitute \cref{eq:fr-predictor} and \cref{eq:prediction-residual}:
+$y_H - \hat y_H = y_H - \hat y_L - \delta_\phi = q_H - \delta_\phi$.
+\end{proof}
+
+\Cref{prop:residual-identity} corrects the previous interpretation: a good parent helps because it makes $q_H$ lower-variance and easier to learn, not because parent error is an unavoidable lower bound. The relevant quantity for rank selection is therefore the residual operator spectrum on the frozen representation.
+
+\section{Experiments}
+
+\subsection{Data and protocols}
+
+We use JARVIS-2021 and JARVIS-2022 band-gap data loaded via \texttt{jarvis-tools}. Targets are parsed to reject missing or non-finite values. To prevent leakage across versions and fidelities, we assign a global canonical material-group split based on reduced composition, density, and volume per atom. The same material therefore always falls in the same train/val/test partition, whether it appears as 2021 OPT, 2021 MBJ, 2022 OPT, or 2022 MBJ.
+
+\textbf{Protocol B (multi-fidelity band gap).} The canonical two-task sequence is OptB88vdW (OPT) $\to$ TB-mBJ (MBJ). We first focus on the JARVIS-2022 snapshot with variable amounts of MBJ training data ($N_H$) and all available OPT training data ($N_L$), as described in the decisive experiment below. The 2021$\to$2022 version-evolution axis is treated as a separate, later validation.
+
+\subsection{Periodic graph construction}
+
+We implement an explicit periodic-edge graph builder in which nodes are exactly the unit-cell atoms and edges carry integer lattice shifts $\mathbf n_{ij}$, so the relative displacement is $\mathbf r_{ij}=\mathbf x_j + \mathbf L\mathbf n_{ij} - \mathbf x_i$. MatGL and ALIGNN backbones consume this sparse graph directly. The older dense EGNN path, which recomputes distances from unit-cell coordinates, is retained only for backward compatibility and is marked with a warning that it drops periodic-boundary information.
+
+\subsection{Diagnostic redesign}
+
+Initial symmetric PhyTCA failed a Phase-0 screen due to sequential optimization interference. Diagnostic experiments D1--D6 isolated the issue and showed that freezing the OPT route and learning a residual on top (FR-PhyTCA) eliminated forgetting while improving MBJ accuracy over parameter-matched baselines. Key findings:
+\begin{itemize}[leftmargin=*]
+    \item D4/D5/D6 preserved exact parent-route invariance (OPT-route drift $=0.00$).
+    \item FR-PhyTCA at 2k training samples achieved MBJ nMAE $0.446$ vs. $0.835$ for frozen-OPT affine correction and $0.838$ for frozen-OPT residual correction.
+    \item Updating the shared top encoder layer improved MBJ accuracy but broke parent-route invariance, motivating the copy-on-write top-block baseline.
+\end{itemize}
+These diagnostics informed the decisive experiment but are not themselves the main result.
+
+\subsection{Decisive single-snapshot Protocol~B experiment}
+
+To position the method before scaling to long sequences, we run a single-snapshot JARVIS-2022 OPT$\to$MBJ experiment with:
+\begin{itemize}[leftmargin=*]
+    \item Fixed $N_L=\text{all}$ and $N_H\in\{100,500,1000,2000,5000,\text{all}\}$.
+    \item Methods: frozen parent, affine correction, residual correction, FR-LoRA-AB, FR-LoRA-ABA/SingleChild, parameter-matched bottleneck/MLP, copy-on-write top block, full child fine-tuning, joint upper bound.
+    \item Rank sweep $r\in\{2,4,8,16,32\}$ with both same-rank and parameter-matched comparisons.
+    \item Seeds $\{42,43,44\}$.
+    \item Global canonical material-group splits.
+\end{itemize}
+The experiment reports OPT and MBJ MAE/nMAE, parent-route drift, incremental and stored parameters, checkpoint size, peak GPU memory, wall-clock time, and inference latency. Full results will be reported in the final version.
+
+\subsection{Strong-backbone validation}
+
+We integrate MatGL and ALIGNN (pure-PyTorch, no DGL required) as frozen backbones for \texttt{ContinualCrystalModel}. Preliminary tests confirm that the FR adapters can be inserted after the backbone's node-level representations and that exact retention still holds. The decisive experiment will be repeated on these stronger backbones to verify that the residual advantage is not an artifact of the small random EGNN encoder.
+
+\section{Conclusion}
+
+We reframed continual learning for materials informatics as exact-retention fidelity-residual adaptation. By freezing a parent fidelity route and learning each higher fidelity as a small residual, the framework guarantees zero parent forgetting by construction. The single-child residual is a low-rank adapter (LoRA-ABA); multi-axis Tucker sharing is reserved for settings with multiple properties or fidelities. We corrected the fidelity-error analysis to a prediction-residual identity, implemented global canonical material-group splits to prevent leakage, and provided a decisive single-snapshot experiment script for rigorous method comparison. The next step is to run the decisive sweep on EGNN, MatGL, and ALIGNN backbones and use the results to finalize the method positioning for ICLR 2027.
+
+\section*{Acknowledgements}
+
+\section*{Impact Statement}
+
+This work aims to reduce the computational and environmental cost of retraining materials models as databases grow, while preserving scientific reliability. We see no specific negative societal impacts that must be highlighted.
+
+\bibliography{main}
+\bibliographystyle{icml2025}
+
+\newpage
+\appendix
+\onecolumn
+\section{Proofs}
+\label{sec:proofs}
+
+\subsection{Proof of Theorem~\ref{thm:invariance}}
+
+The parent prediction depends only on $\Theta_P$. Because the child optimizer's parameter set is disjoint from $\Theta_P$ and no child module shares parameters with the parent route, no update during child training modifies $\Theta_P$. Hence the parent mapping remains identical and absolute forgetting is zero.
+
+\subsection{Proof of Proposition~\ref{prop:growth}}
+
+For one layer the single-child adapter stores $\mathbf U_{\mathrm{in}}\in\mathbb R^{d\times r}$, $\mathbf U_{\mathrm{out}}\in\mathbb R^{d\times r}$, and $\mathbf M\in\mathbb R^{r\times r}$, giving $2dr+r^2$ parameters. Across $L$ layers this is $L(2dr+r^2)$, plus $d+1$ for the new head.
+
+\subsection{Proof of Proposition~\ref{prop:residual-identity}}
+
+Given $\hat y_H=\hat y_L+\delta_\phi$ and $q_H=y_H-\hat y_L$, we have $y_H-\hat y_H = y_H-\hat y_L-\delta_\phi = q_H-\delta_\phi$. Taking absolute values yields the identity.
+
+\section{Implementation notes}
+\label{sec:implementation}
+
+\textbf{Adapter forward.} The residual is applied without materializing a full $d\times d$ weight matrix: $\mathbf H\mapsto \mathbf H\mathbf U_{\mathrm{in}}\mathbf M^{\!\top}\mathbf U_{\mathrm{out}}^{\!\top}$.
+
+\textbf{Exact retention checks.} We verify parent-route invariance by (i) state-dict hash before/after child training, (ii) prediction hash on a held-out parent set, and (iii) max absolute prediction drift.
+
+\textbf{Global splits.} The canonical material-group identifier combines reduced composition, density, and volume per atom. It is invariant to primitive/conventional cell choice and to supercell expansion.
+
+\textbf{Dependencies.} The core code uses PyTorch, PyTorch Geometric, pymatgen, and jarvis-tools. MatGL and ALIGNN are optional backbone dependencies. DGL is not required; the ALIGNN backbone uses a pure-PyTorch implementation.
+
+\end{document}

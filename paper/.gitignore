@@ -1,0 +1,14 @@
+# Generated LaTeX files
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.toc
+main.pdf
+
+# ICML 2025 template assets that must be tracked
+!icml_numpapers.pdf
