@@ -316,3 +316,152 @@ def test_periodic_image_self_loop_handling():
     assert torch.equal(original_mask, (offsets == 0).all(dim=1))
     # There are exactly n_original original atoms.
     assert original_mask.sum() == graph["n_original"]
+
+# ---------------------------------------------------------------------------
+# Explicit periodic-edge graph tests
+# ---------------------------------------------------------------------------
+
+
+def _sorted_edge_tuples(graph: dict[str, torch.Tensor]) -> list[tuple[int, int, tuple[int, int, int]]]:
+    """Return a sorted list of (src, dst, shift) edge tuples."""
+    edge_index = graph["edge_index"].tolist()
+    edge_shifts = graph["edge_shifts"].tolist()
+    return sorted(
+        (int(edge_index[0][i]), int(edge_index[1][i]), tuple(edge_shifts[i]))
+        for i in range(graph["edge_index"].size(1))
+    )
+
+
+def test_explicit_periodic_graph_nodes_are_unit_cell_atoms():
+    """Explicit periodic graph has one node per unit-cell atom."""
+    from periodic_graph import build_periodic_edge_graph
+
+    lattice = Lattice.cubic(4.0)
+    struct = Structure(lattice, ["Si", "Si"], [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+    graph = build_periodic_edge_graph(struct, cutoff=5.0)
+
+    assert graph["node_feats"].shape == (2, 92)
+    assert graph["coords"].shape == (2, 3)
+    assert graph["batch"].shape == (2,)
+    assert graph["n_original"] == 2
+
+
+def test_explicit_periodic_graph_edges_respect_cutoff():
+    """All explicit periodic edges are within the cutoff radius."""
+    from periodic_graph import build_periodic_edge_graph
+
+    lattice = Lattice.cubic(4.0)
+    struct = Structure(lattice, ["Si", "Si"], [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+    cutoff = 3.5
+    graph = build_periodic_edge_graph(struct, cutoff=cutoff)
+
+    norms = graph["edge_vectors"].norm(dim=1)
+    assert torch.all(norms <= cutoff + 1e-4)
+
+
+def test_explicit_periodic_graph_invariant_under_translation():
+    """Translating the unit cell leaves the edge set unchanged."""
+    from periodic_graph import build_periodic_edge_graph
+
+    lattice = Lattice.cubic(4.0)
+    coords = np.array([[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+    struct1 = Structure(lattice, ["Si", "Si"], coords)
+    struct2 = Structure(lattice, ["Si", "Si"], coords + np.array([0.1, 0.2, 0.3]))
+
+    g1 = build_periodic_edge_graph(struct1, cutoff=5.0)
+    g2 = build_periodic_edge_graph(struct2, cutoff=5.0)
+
+    assert _sorted_edge_tuples(g1) == _sorted_edge_tuples(g2)
+    assert torch.allclose(g1["edge_vectors"], g2["edge_vectors"], atol=1e-4)
+
+
+def test_explicit_to_dense_original_mask_all_true():
+    """Dense conversion marks every node as an original atom."""
+    from periodic_graph import build_periodic_edge_graph, to_dense_tensors
+
+    lattice = Lattice.cubic(4.0)
+    struct = Structure(lattice, ["Si", "Si"], [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+    graph = build_periodic_edge_graph(struct, cutoff=5.0)
+
+    node_feats, coords, mask, original_mask = to_dense_tensors(graph)
+    assert node_feats.shape == (2, 92)
+    assert coords.shape == (2, 3)
+    assert mask.sum() == 2
+    assert torch.all(original_mask)
+
+
+def test_explicit_to_dense_with_padding():
+    """Dense conversion pads to max_atoms and preserves real-atom masks."""
+    from periodic_graph import build_periodic_edge_graph, to_dense_tensors
+
+    lattice = Lattice.cubic(4.0)
+    struct = Structure(lattice, ["Si"], [[0.0, 0.0, 0.0]])
+    graph = build_periodic_edge_graph(struct, cutoff=5.0)
+
+    node_feats, coords, mask, original_mask = to_dense_tensors(graph, max_atoms=4)
+    assert node_feats.shape == (4, 92)
+    assert coords.shape == (4, 3)
+    assert mask.sum() == 1
+    assert original_mask.sum() == 4
+    assert torch.equal(mask, torch.tensor([True, False, False, False]))
+
+
+def test_collate_periodic_graphs_batch_vector():
+    """Collation produces the correct batch assignment and dense tensors."""
+    from periodic_graph import build_periodic_edge_graph, collate_periodic_graphs
+
+    lattice = Lattice.cubic(4.0)
+    struct1 = Structure(lattice, ["Si"], [[0.0, 0.0, 0.0]])
+    struct2 = Structure(lattice, ["Si", "Si"], [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+
+    g1 = build_periodic_edge_graph(struct1, cutoff=5.0)
+    g2 = build_periodic_edge_graph(struct2, cutoff=5.0)
+    batched = collate_periodic_graphs([g1, g2])
+
+    expected_batch = torch.tensor([0, 1, 1], dtype=torch.long)
+    assert torch.equal(batched["batch"], expected_batch)
+    assert batched["dense_node_feats"].shape[0] == 2
+    assert batched["dense_mask"].shape[0] == 2
+    assert torch.all(batched["dense_original_mask"])
+
+
+def test_periodic_edge_graph_builder_callable():
+    """``PeriodicEdgeGraphBuilder`` can be used as a drop-in graph builder."""
+    from data import PeriodicEdgeGraphBuilder
+
+    lattice = Lattice.cubic(4.0)
+    struct = Structure(lattice, ["Si", "Si"], [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]])
+    builder = PeriodicEdgeGraphBuilder(cutoff=5.0)
+    graph = builder(struct)
+
+    assert graph["node_feats"].shape[0] == 2
+    assert graph["edge_index"].dtype == torch.long
+    assert graph["edge_shifts"].dtype == torch.long
+
+
+def test_dataset_explicit_edges_flag():
+    """JARVISCrystalDataset can switch to the explicit-edge builder."""
+    from data import JARVISCrystalDataset, PeriodicEdgeGraphBuilder
+
+    records = [
+        {
+            "jid": "test-1",
+            "structure": Structure(Lattice.cubic(4.0), ["Si"], [[0.0, 0.0, 0.0]]),
+            "formula": "Si",
+            "target": 1.0,
+        }
+    ]
+
+    dense_ds = JARVISCrystalDataset(records, normalize_target=False)
+    node_feats, coords, original_mask, target = dense_ds[0]
+    assert isinstance(node_feats, torch.Tensor)  # old mode returns dense tensors
+    assert node_feats.shape[0] == coords.shape[0]
+    assert original_mask.dtype == torch.bool
+    assert target.item() == pytest.approx(1.0)
+
+    explicit_ds = JARVISCrystalDataset(records, normalize_target=False, use_explicit_edges=True)
+    graph, target = explicit_ds[0]
+    assert isinstance(graph, dict)
+    assert "edge_index" in graph
+    assert "edge_shifts" in graph
+    assert target.item() == pytest.approx(1.0)

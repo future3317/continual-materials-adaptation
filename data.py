@@ -25,6 +25,8 @@ import torch
 from pymatgen.core import Lattice, Structure
 from torch.utils.data import Dataset
 
+from periodic_graph import build_periodic_edge_graph
+
 
 # ---------------------------------------------------------------------------
 # JARVIS cache helpers
@@ -561,6 +563,39 @@ class PeriodicGraphBuilder:
         )
 
 
+class PeriodicEdgeGraphBuilder:
+    """Build an explicit periodic-edge graph from a pymatgen ``Structure``.
+
+    Unlike ``PeriodicGraphBuilder``, this builder keeps only the unit-cell atoms
+    as nodes and stores periodicity as integer lattice shifts on the edges.  See
+    ``periodic_graph.build_periodic_edge_graph`` for details.
+
+    Attributes:
+        cutoff: Real-space cutoff radius for edges.
+        max_neighbors: Optional per-atom cap on the number of closest neighbors.
+        node_feature_dim: Dimensionality of one-hot element node features.
+    """
+
+    def __init__(
+        self,
+        cutoff: float = 5.0,
+        max_neighbors: int | None = None,
+        node_feature_dim: int = 92,
+    ) -> None:
+        self.cutoff = cutoff
+        self.max_neighbors = max_neighbors
+        self.node_feature_dim = node_feature_dim
+
+    def __call__(self, structure: Structure) -> dict[str, torch.Tensor]:
+        """Build explicit periodic-edge graph tensors for the input structure."""
+        return build_periodic_edge_graph(
+            structure,
+            cutoff=self.cutoff,
+            max_neighbors=self.max_neighbors,
+            node_feature_dim=self.node_feature_dim,
+        )
+
+
 def _element_one_hot(element: str, dim: int = 92) -> torch.Tensor:
     """One-hot encode an element by atomic number (Z <= dim)."""
     from pymatgen.core import Element
@@ -637,12 +672,20 @@ class JARVISCrystalDataset(Dataset):
         graph_builder: Callable[[Structure], dict[str, torch.Tensor]] | None = None,
         normalize_target: bool = True,
         split: str | None = None,
+        use_explicit_edges: bool = False,
     ) -> None:
         if split is not None:
             records = [r for r in records if r.get("split") == split]
         self.records = records
-        self.graph_builder = graph_builder or PeriodicGraphBuilder()
         self.normalize_target = normalize_target
+        self.use_explicit_edges = use_explicit_edges
+
+        if graph_builder is not None:
+            self.graph_builder = graph_builder
+        elif use_explicit_edges:
+            self.graph_builder = PeriodicEdgeGraphBuilder()
+        else:
+            self.graph_builder = PeriodicGraphBuilder()
 
         if records:
             targets = torch.tensor([r["target"] for r in records], dtype=torch.float32)
@@ -655,12 +698,18 @@ class JARVISCrystalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor]:
         rec = self.records[idx]
         graph = self.graph_builder(rec["structure"])
         target = torch.tensor(rec["target"], dtype=torch.float32)
         if self.normalize_target:
             target = (target - self.target_mean) / self.target_std
+
+        if self.use_explicit_edges:
+            return graph, target
+
         return (
             graph["node_feats"],
             graph["coords"],

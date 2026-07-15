@@ -1,11 +1,10 @@
-"""Diagnostic model variants and experiments for PhyTCA redesign.
+"""Diagnostic experiments for the exact-retention continual crystal model.
 
-This module implements the six 2k/seed-42 diagnostic experiments requested for
-Protocol B: full joint, joint PhyTCA, sequential PhyTCA, frozen-OPT correction
-(affine and residual), and progressive Tucker residual with optional OPT
-distillation.  All variants start from the same canonical frozen-encoder
-checkpoint where applicable, and all metrics are reported on the held-out
-``continual_dev`` split.
+This module implements the D1–D6 diagnostic experiments from Protocol B using
+``models.ContinualCrystalModel`` and the adapter zoo from ``adapters.py``.
+All PhyTCA-derived methods enforce exact retention by structural isolation:
+each task owns a private adapter bank + head, and completed tasks are frozen
+via ``requires_grad=False`` so they are never touched by later optimizers.
 """
 
 from __future__ import annotations
@@ -21,12 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from adapters import ADAPTER_REGISTRY
 from baselines import _evaluate_all_seen, _make_loaders, _train_one_task
 from data import JARVISCrystalDataset, collate_crystals
-from phytca import (
-    AdapterCrystalGraphLayer,
-    PhyTCAModel,
-    Tucker4DAdapter,
+from models import (
+    ContinualCrystalModel,
+    PredictionResidualHead,
     backward_transfer,
     compute_mad,
     forgetting,
@@ -45,10 +44,29 @@ def _load_canonical_base(
     base_state_dict: dict[str, torch.Tensor],
     device: torch.device,
 ) -> None:
-    """Load a canonical frozen-encoder state into a model on ``device``."""
-    missing, unexpected = model.load_state_dict(copy.deepcopy(base_state_dict), strict=False)
-    if missing or unexpected:
-        print(f"  Warning: canonical base load missing={missing} unexpected={unexpected}")
+    """Load a canonical frozen-encoder state into a ContinualCrystalModel.
+
+    The canonical state comes from ``PhyTCAModel`` (``phytca.py``), so we map
+    its key names to the encoder keys of ``ContinualCrystalModel``.  Task-
+    specific adapters and heads are not loaded here; they are created later
+    with ``add_task``.
+    """
+    mapped: dict[str, torch.Tensor] = {}
+    for k, v in base_state_dict.items():
+        if k.startswith("node_embed."):
+            mapped["encoder." + k] = v.to(device)
+        elif k.startswith("layers.") and ".encoder." in k:
+            # layers.0.encoder.conv... -> encoder.layers.0.conv...
+            parts = k.split(".")
+            new_key = f"encoder.layers.{parts[1]}." + ".".join(parts[3:])
+            mapped[new_key] = v.to(device)
+        # Adapter / head keys are task-specific and intentionally skipped.
+
+    missing, unexpected = model.load_state_dict(mapped, strict=False)
+    # Missing encoder parameters are expected if the canonical state only
+    # contains a subset, but missing adapter/head keys are normal.
+    if unexpected:
+        print(f"  Warning: canonical base load unexpected={unexpected}")
 
 
 def _train_jointly(
@@ -65,6 +83,11 @@ def _train_jointly(
     extra_loss_fn: Callable[[nn.Module], torch.Tensor] | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor, float]]:
     """Train ``model`` jointly on all ``tasks`` and return per-task stats."""
+    # For ContinualCrystalModel, allocate every task before joint training.
+    if hasattr(model, "add_task"):
+        for _, prop_name, fid_name in tasks:
+            model.add_task(prop2id[prop_name], fid2id[fid_name])
+
     task_stats: list[tuple[torch.Tensor, torch.Tensor, float]] = []
     loaders: list[tuple[DataLoader, DataLoader]] = []
     for recs in task_records:
@@ -108,7 +131,9 @@ def _train_jointly(
             fid_id = fid2id[fid_name]
             _, val_loader = loaders[t]
             mean, std, mad = task_stats[t]
-            val_nmaes.append(evaluate_loader(model, val_loader, prop_id, fid_id, mean, std, mad, device))
+            val_nmaes.append(
+                evaluate_loader(model, val_loader, prop_id, fid_id, mean, std, mad, device)
+            )
         avg_val = sum(val_nmaes) / len(val_nmaes)
 
         if avg_val < best_nmae:
@@ -174,7 +199,9 @@ def _train_single_task(
             loss.backward()
             optimizer.step()
 
-        val_nmae = evaluate_loader(model, val_loader, prop_id, fid_id, target_mean, target_std, mad, device)
+        val_nmae = evaluate_loader(
+            model, val_loader, prop_id, fid_id, target_mean, target_std, mad, device
+        )
         if val_nmae < best_nmae:
             best_nmae = val_nmae
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -214,7 +241,9 @@ def _evaluate_on_dev(
         dev_ds.target_mean = float(mean_p)
         dev_ds.target_std = float(std_p)
         dev_ds.normalize_target = True
-        loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
+        loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
         nmaes.append(evaluate_loader(model, loader, pid, fid, mean_p, std_p, mad_p, device))
     return nmaes
 
@@ -227,41 +256,13 @@ def _count_total(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def _count_params(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
 def _trainable_param_names(model: nn.Module) -> list[str]:
     """Return names of parameters that currently require gradients."""
     return [name for name, p in model.named_parameters() if p.requires_grad]
-
-
-def _project_orthogonal(child: torch.Tensor, parent: torch.Tensor) -> torch.Tensor:
-    """Return ``child`` columns projected onto the complement of ``parent`` columns."""
-    with torch.no_grad():
-        q_parent, _ = torch.linalg.qr(parent)
-        residual = child - q_parent @ (q_parent.T @ child)
-        q_child, _ = torch.linalg.qr(residual)
-        # QR may drop columns if residual is rank-deficient; pad to keep rank.
-        if q_child.shape[1] < child.shape[1]:
-            need = child.shape[1] - q_child.shape[1]
-            pad = torch.randn(child.shape[0], need, device=child.device, dtype=child.dtype)
-            pad = pad - q_parent @ (q_parent.T @ pad) - q_child @ (q_child.T @ pad)
-            q_pad, _ = torch.linalg.qr(pad)
-            q_child = torch.cat([q_child, q_pad[:, :need]], dim=1)
-        return q_child[:, : child.shape[1]]
-
-
-def _orthogonalize_child_factors(model: nn.Module) -> None:
-    """Project each child Tucker factor to be orthogonal to its parent factor."""
-    for layer in model.layers:
-        child = layer.adapter.child
-        parent = layer.adapter.parent
-        child.U_in.data = _project_orthogonal(child.U_in.data, parent.U_in.data)
-        child.U_out.data = _project_orthogonal(child.U_out.data, parent.U_out.data)
-
-
-def _tie_child_factors_to_parent(model: nn.Module) -> None:
-    """Share ``U_in``/``U_out`` between child and parent (parent remains frozen)."""
-    for layer in model.layers:
-        layer.adapter.child.U_in = layer.adapter.parent.U_in
-        layer.adapter.child.U_out = layer.adapter.parent.U_out
 
 
 def _state_dict_hash(state_dict: dict[str, torch.Tensor]) -> str:
@@ -294,30 +295,40 @@ def train_opt_parent(
 ) -> dict[str, Any]:
     """Train the OPT parent once and return a reproducible checkpoint bundle.
 
-    The bundle contains the trained model state dict, normalizer statistics,
-    T1@T1 nMAE on continual_dev, and hashes for audit comparisons across D4-D6.
+    The bundle contains the trained ``ContinualCrystalModel`` state dict,
+    normalizer statistics, T1@T1 nMAE on ``continual_dev``, and hashes for
+    audit comparisons across D4–D6.
     """
     prop2id, fid2id = _name_to_id(tasks)
     opt_prop_id = prop2id["band_gap"]
     opt_fid_id = fid2id["OptB88vdW"]
 
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
     if base_state_dict is not None:
         _load_canonical_base(model, base_state_dict, device)
 
+    model.add_task(opt_prop_id, opt_fid_id)
+
     train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
     _train_single_task(
-        model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        model,
+        train_loader,
+        val_loader,
+        opt_prop_id,
+        opt_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
     # T1@T1 on continual_dev.
@@ -325,8 +336,13 @@ def train_opt_parent(
     dev_ds.target_mean = float(mean)
     dev_ds.target_std = float(std)
     dev_ds.normalize_target = True
-    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-    t1_after_t1 = evaluate_loader(model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+    dev_loader = DataLoader(
+        dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+    )
+    t1_after_t1 = evaluate_loader(
+        model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+    )
+
     # OPT predictions on dev for hash comparison.
     model.eval()
     preds: list[torch.Tensor] = []
@@ -374,15 +390,15 @@ def _run_label_and_metrics(
     start_time: float,
     nmaes: list[list[float]] | None = None,
 ) -> dict[str, Any]:
-    """Common metric extraction after a two-task continual run.
-
-    For sequential methods ``nmaes`` can be precomputed after each task so that
-    T1@T1 reflects the model right after Task 1 rather than after Task 2.
-    """
+    """Common metric extraction after a two-task continual run."""
     if nmaes is None:
         nmaes = []
         for t in range(len(tasks)):
-            nmaes.append(_evaluate_on_dev(model, tasks, task_records, task_stats, prop2id, fid2id, batch_size, device, t))
+            nmaes.append(
+                _evaluate_on_dev(
+                    model, tasks, task_records, task_stats, prop2id, fid2id, batch_size, device, t
+                )
+            )
 
     task1_after_t1 = nmaes[0][0]
     task1_after_t2 = nmaes[1][0]
@@ -429,34 +445,58 @@ def d1_full_joint(
     adapter_rank: int = 8,
     num_nearest_neighbors: int = 8,
 ) -> dict[str, Any]:
-    """Joint training with the full model fine-tuned (285k trainable)."""
+    """Joint training with the encoder unfrozen (upper bound)."""
     prop2id, fid2id = _name_to_id(tasks)
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=False,
     ).to(device)
+
+    # Add every task so the model has all heads and adapter banks.
+    for _, prop_name, fid_name in tasks:
+        model.add_task(prop2id[prop_name], fid2id[fid_name])
+
+    # Unfreeze the crystal-graph encoder for full fine-tuning.
+    for p in model.encoder.parameters():
+        p.requires_grad = True
 
     start = time.time()
     task_stats = _train_jointly(
-        model, tasks, task_records, prop2id, fid2id, device,
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
+        model,
+        tasks,
+        task_records,
+        prop2id,
+        fid2id,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
     )
     result = _run_label_and_metrics(
-        "full_joint_upper_bound", model, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start,
+        "full_joint_upper_bound",
+        model,
+        tasks,
+        task_records,
+        task_stats,
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["incremental_params"] = 0
     return result
 
 
 # ---------------------------------------------------------------------------
-# D2: Joint PhyTCA (frozen backbone + Tucker adapter)
+# D2: Joint PhyTCA (frozen encoder, all tasks share adapter banks)
 # ---------------------------------------------------------------------------
 
 
@@ -474,36 +514,55 @@ def d2_joint_phytca(
     adapter_rank: int = 8,
     num_nearest_neighbors: int = 8,
 ) -> dict[str, Any]:
-    """Joint training on OPT and MBJ with only adapter/head trainable."""
+    """Joint training on all tasks with only adapter/head parameters trainable."""
     prop2id, fid2id = _name_to_id(tasks)
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
     if base_state_dict is not None:
         _load_canonical_base(model, base_state_dict, device)
 
+    for _, prop_name, fid_name in tasks:
+        model.add_task(prop2id[prop_name], fid2id[fid_name])
+
     start = time.time()
     task_stats = _train_jointly(
-        model, tasks, task_records, prop2id, fid2id, device,
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
+        model,
+        tasks,
+        task_records,
+        prop2id,
+        fid2id,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
     )
     result = _run_label_and_metrics(
-        "phytca_joint_upper_bound", model, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start,
+        "phytca_joint_upper_bound",
+        model,
+        tasks,
+        task_records,
+        task_stats,
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["incremental_params"] = 0
     return result
 
 
 # ---------------------------------------------------------------------------
-# D3: Sequential PhyTCA (existing behavior)
+# D3: Sequential PhyTCA (structural isolation, no stability loss)
 # ---------------------------------------------------------------------------
 
 
@@ -518,21 +577,27 @@ def d3_sequential_phytca(
     batch_size: int = 32,
     lr: float = 1e-3,
     patience: int = 3,
-    mu: float = 0.01,
+    mu: float = 0.0,
     adapter_rank: int = 8,
     num_nearest_neighbors: int = 8,
 ) -> dict[str, Any]:
-    """Sequential PhyTCA with stability loss."""
+    """Sequential PhyTCA with exact retention via structural isolation.
+
+    The ``mu`` argument is kept for API compatibility but is ignored: the new
+    architecture guarantees zero forgetting by freezing old tasks, so a
+    stability loss is no longer required.
+    """
+    _ = mu
     prop2id, fid2id = _name_to_id(tasks)
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
     if base_state_dict is not None:
         _load_canonical_base(model, base_state_dict, device)
@@ -540,36 +605,54 @@ def d3_sequential_phytca(
     start = time.time()
     task_stats: list[tuple[torch.Tensor, torch.Tensor, float]] = []
     nmaes: list[list[float]] = []
-    anchor: dict = {}
+
     for t, (_, prop_name, fid_name) in enumerate(tasks):
         prop_id = prop2id[prop_name]
         fid_id = fid2id[fid_name]
+        model.add_task(prop_id, fid_id)
+
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[t], batch_size)
+        mean, std, mad = _train_single_task(
+            model,
+            train_loader,
+            val_loader,
+            prop_id,
+            fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
+        )
         task_stats.append((mean, std, mad))
 
-        def extra_loss_fn(m: nn.Module) -> torch.Tensor:
-            return m.stability_loss(mu, anchor)
-
-        mean, std, mad = _train_single_task(
-            model, train_loader, val_loader, prop_id, fid_id, device,
-            epochs=epochs, lr=lr, patience=patience, extra_loss_fn=extra_loss_fn,
+        nmaes.append(
+            _evaluate_on_dev(
+                model, tasks, task_records, task_stats, prop2id, fid2id, batch_size, device, t
+            )
         )
-        task_stats[-1] = (mean, std, mad)
-
-        # Evaluate on all seen tasks using the current model state.
-        nmaes.append(_evaluate_on_dev(model, tasks, task_records, task_stats, prop2id, fid2id, batch_size, device, t))
 
         model.freeze_task(prop_id, fid_id)
-        anchor = model.anchor_state()
 
     result = _run_label_and_metrics(
-        "phytca_sequential", model, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start, nmaes=nmaes,
+        "phytca_sequential",
+        model,
+        tasks,
+        task_records,
+        task_stats,
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
+        nmaes=nmaes,
     )
-    # After Task 1 the trainable count is the Task-1 adapter+head.
-    # Incremental for Task 2 is the MBJ head + its slice of the adapter.
-    # Approximate using the model's per-task adapter parameter count.
-    result["incremental_params"] = int(model.get_parameter_group_counts()["heads"] / len(tasks)) + 100  # rough
+    if len(tasks) >= 1:
+        _, last_prop, last_fid = tasks[-1]
+        result["incremental_params"] = model.count_incremental_parameters(
+            prop2id[last_prop], fid2id[last_fid]
+        )
+    else:
+        result["incremental_params"] = 0
     return result
 
 
@@ -579,19 +662,18 @@ def d3_sequential_phytca(
 
 
 class FrozenOptCorrectionModel(nn.Module):
-    """Freeze OPT route and learn a small MBJ correction on top of OPT predictions.
+    """Freeze the OPT route and learn a small MBJ correction on top.
 
-    The forward pass returns the OPT prediction for the OPT fidelity.  For the
-    MBJ fidelity it returns either
-        y_mbj = alpha(h) * y_opt.detach() + beta(h)      (affine)
-    or
-        y_mbj = y_opt.detach() + delta(h)                (residual)
-    where ``h`` is the pooled representation from the frozen OPT route.
+    For the affine variant two MLPs (alpha, beta) operate in **physical units**;
+    for the residual variant ``models.PredictionResidualHead`` is used to
+    de-normalize the parent prediction, add a physical residual, and
+    re-normalize to the child (MBJ) space.  This avoids the cross-fidelity
+    normalization bug described in ``反馈_2.md`` 5.1.
     """
 
     def __init__(
         self,
-        base_model: PhyTCAModel,
+        base_model: ContinualCrystalModel,
         opt_prop_id: int,
         opt_fid_id: int,
         affine: bool = True,
@@ -603,14 +685,16 @@ class FrozenOptCorrectionModel(nn.Module):
         self.affine = affine
         hidden_dim = base_model.hidden_dim
 
-        # Small correction MLP.
-        mlp = lambda: nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # Freeze the entire base model.
+        for p in self.base.parameters():
+            p.requires_grad = False
 
         if affine:
+            mlp = lambda: nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
             self.alpha = mlp()
             self.beta = mlp()
             # Initialize alpha near 1, beta near 0.
@@ -624,11 +708,20 @@ class FrozenOptCorrectionModel(nn.Module):
                     nn.init.zeros_(m.weight)
                     nn.init.zeros_(m.bias)
         else:
-            self.delta = mlp()
-            for m in self.delta.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.zeros_(m.weight)
-                    nn.init.zeros_(m.bias)
+            self.residual_head = PredictionResidualHead(hidden_dim)
+
+    def set_normalizers(
+        self,
+        parent_mean: torch.Tensor,
+        parent_std: torch.Tensor,
+        child_mean: torch.Tensor,
+        child_std: torch.Tensor,
+    ) -> None:
+        device = next(self.parameters()).device
+        self.register_buffer("parent_mean", parent_mean.to(device))
+        self.register_buffer("parent_std", parent_std.to(device))
+        self.register_buffer("child_mean", child_mean.to(device))
+        self.register_buffer("child_std", child_std.to(device))
 
     def forward(
         self,
@@ -640,16 +733,23 @@ class FrozenOptCorrectionModel(nn.Module):
         fid_id: int,
     ) -> torch.Tensor:
         h = self.base.encode(
-            node_feats, coords, mask, original_mask, prop_id, self.opt_fid_id
+            node_feats, coords, mask, original_mask, self.opt_prop_id, self.opt_fid_id
         )
-        y_opt = self.base.heads[f"p{prop_id}_f{self.opt_fid_id}"](h).squeeze(-1)
+        key = self.base._task_key(self.opt_prop_id, self.opt_fid_id)
+        y_opt = self.base.heads[key](h).squeeze(-1)
         if fid_id == self.opt_fid_id:
             return y_opt
+
         if self.affine:
             alpha = self.alpha(h).squeeze(-1)
             beta = self.beta(h).squeeze(-1)
-            return alpha * y_opt.detach() + beta
-        return y_opt.detach() + self.delta(h).squeeze(-1)
+            parent_pred_phys = y_opt * self.parent_std + self.parent_mean
+            child_pred_phys = alpha * parent_pred_phys + beta
+            return (child_pred_phys - self.child_mean) / self.child_std
+
+        return self.residual_head(
+            h, y_opt, self.parent_mean, self.parent_std, self.child_mean, self.child_std
+        )
 
 
 def _frozen_opt_correction(
@@ -674,62 +774,94 @@ def _frozen_opt_correction(
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    base_model = PhyTCAModel(
+    base_model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
 
     start = time.time()
 
     if opt_parent_state is not None:
-        base_model.load_state_dict({k: v.to(device) for k, v in opt_parent_state["state_dict"].items()})
+        base_model.add_task(opt_prop_id, opt_fid_id)
+        base_model.load_state_dict(
+            {k: v.to(device) for k, v in opt_parent_state["state_dict"].items()},
+            strict=False,
+        )
         mean, std, mad = opt_parent_state["mean"], opt_parent_state["std"], opt_parent_state["mad"]
         t1_after_t1 = opt_parent_state["task1_after_task1"]
     else:
         if base_state_dict is not None:
             _load_canonical_base(base_model, base_state_dict, device)
+        base_model.add_task(opt_prop_id, opt_fid_id)
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
         _train_single_task(
-            base_model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-            epochs=epochs, lr=lr, patience=patience,
+            base_model,
+            train_loader,
+            val_loader,
+            opt_prop_id,
+            opt_fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
         )
         dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
         dev_ds.target_mean = float(mean)
         dev_ds.target_std = float(std)
         dev_ds.normalize_target = True
-        dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-        t1_after_t1 = evaluate_loader(base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+        dev_loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        t1_after_t1 = evaluate_loader(
+            base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+        )
 
     task1_stats = (mean, std, mad)
 
-    # Freeze encoder and OPT head.
+    # Freeze encoder and OPT route.
     for p in base_model.parameters():
         p.requires_grad = False
 
     correction = FrozenOptCorrectionModel(
         base_model, opt_prop_id, opt_fid_id, affine=affine
     ).to(device)
-    task2_trainable_names = _trainable_param_names(correction)
 
     # Task 2: train correction branch only.
     train_loader2, val_loader2, _, mean2, std2, mad2 = _make_loaders(task_records[1], batch_size)
     task2_stats = (mean2, std2, mad2)
+    correction.set_normalizers(mean, std, mean2, std2)
+    task2_trainable_names = _trainable_param_names(correction)
+
     _train_single_task(
-        correction, train_loader2, val_loader2, opt_prop_id, mbj_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        correction,
+        train_loader2,
+        val_loader2,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
-    task_stats = [task1_stats, task2_stats]
     label = "frozen_opt_affine_correction" if affine else "frozen_opt_residual_correction"
     result = _run_label_and_metrics(
-        label, correction, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start,
+        label,
+        correction,
+        tasks,
+        task_records,
+        [task1_stats, task2_stats],
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     # Override T1@T1 with the value from the shared OPT parent checkpoint.
     result["task1_after_task1"] = t1_after_t1
@@ -756,9 +888,19 @@ def d4_frozen_opt_affine(
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _frozen_opt_correction(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        affine=True, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        affine=True,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
 
@@ -779,39 +921,80 @@ def d5_frozen_opt_residual(
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _frozen_opt_correction(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        affine=False, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        affine=False,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
 
 
 # ---------------------------------------------------------------------------
-# D6 ablations: corrections on the frozen MBJ parent representation
+# Correction modules for residual baselines
 # ---------------------------------------------------------------------------
 
 
-class FrozenMbjCorrectionModel(nn.Module):
-    """Use the frozen MBJ parent representation and apply a trainable correction.
+class PhysicalResidualCorrection(nn.Module):
+    """Wrap an arbitrary residual module so it operates in physical units."""
 
-    The forward returns the parent OPT prediction for OPT fidelity.  For MBJ it
-    returns ``y_mbj_parent + correction(h_mbj_parent)``.
-    """
+    def __init__(self, correction_module: nn.Module) -> None:
+        super().__init__()
+        self.correction_module = correction_module
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        parent_pred_norm: torch.Tensor,
+        parent_mean: torch.Tensor,
+        parent_std: torch.Tensor,
+        child_mean: torch.Tensor,
+        child_std: torch.Tensor,
+    ) -> torch.Tensor:
+        parent_pred_phys = parent_pred_norm * parent_std + parent_mean
+        residual_phys = self.correction_module(h).squeeze(-1)
+        child_pred_phys = parent_pred_phys + residual_phys
+        return (child_pred_phys - child_mean) / child_std
+
+
+class FrozenOptResidualModel(nn.Module):
+    """Freeze the OPT route and add a physical-residual correction for MBJ."""
 
     def __init__(
         self,
-        base_model: PhyTCAModel,
+        base_model: ContinualCrystalModel,
         opt_prop_id: int,
         opt_fid_id: int,
-        mbj_fid_id: int,
-        correction: nn.Module,
+        correction_module: nn.Module,
     ) -> None:
         super().__init__()
         self.base = base_model
         self.opt_prop_id = opt_prop_id
         self.opt_fid_id = opt_fid_id
-        self.mbj_fid_id = mbj_fid_id
-        self.correction = correction
+        for p in self.base.parameters():
+            p.requires_grad = False
+        self.correction = PhysicalResidualCorrection(correction_module)
+
+    def set_normalizers(
+        self,
+        parent_mean: torch.Tensor,
+        parent_std: torch.Tensor,
+        child_mean: torch.Tensor,
+        child_std: torch.Tensor,
+    ) -> None:
+        device = next(self.parameters()).device
+        self.register_buffer("parent_mean", parent_mean.to(device))
+        self.register_buffer("parent_std", parent_std.to(device))
+        self.register_buffer("child_mean", child_mean.to(device))
+        self.register_buffer("child_std", child_std.to(device))
 
     def forward(
         self,
@@ -822,12 +1005,16 @@ class FrozenMbjCorrectionModel(nn.Module):
         prop_id: int,
         fid_id: int,
     ) -> torch.Tensor:
+        h = self.base.encode(
+            node_feats, coords, mask, original_mask, self.opt_prop_id, self.opt_fid_id
+        )
+        key = self.base._task_key(self.opt_prop_id, self.opt_fid_id)
+        y_opt = self.base.heads[key](h).squeeze(-1)
         if fid_id == self.opt_fid_id:
-            h = self.base.encode(node_feats, coords, mask, original_mask, prop_id, self.opt_fid_id)
-            return self.base.heads[f"p{prop_id}_f{self.opt_fid_id}"](h).squeeze(-1)
-        h = self.base.encode(node_feats, coords, mask, original_mask, prop_id, self.mbj_fid_id)
-        y_mbj_parent = self.base.heads[f"p{prop_id}_f{self.mbj_fid_id}"](h).squeeze(-1)
-        return y_mbj_parent + self.correction(h).squeeze(-1)
+            return y_opt
+        return self.correction(
+            h, y_opt, self.parent_mean, self.parent_std, self.child_mean, self.child_std
+        )
 
 
 class LowRankResidual(nn.Module):
@@ -842,14 +1029,8 @@ class LowRankResidual(nn.Module):
         return h @ self.A @ self.B
 
 
-def _count_params(module: nn.Module) -> int:
-    return sum(p.numel() for p in module.parameters())
-
-
 def _make_parameter_matched_mlp(hidden_dim: int, target_params: int) -> nn.Sequential:
     """Return a two-layer MLP whose trainable count is close to ``target_params``."""
-    # Binary search over bottleneck size.
-    lo, hi = 1, hidden_dim
     best = None
     best_diff = float("inf")
     for mid in range(1, hidden_dim + 1):
@@ -866,14 +1047,14 @@ def _make_parameter_matched_mlp(hidden_dim: int, target_params: int) -> nn.Seque
     )
 
 
-def _frozen_mbj_correction_experiment(
+def _frozen_opt_residual_experiment(
     tasks: list[tuple[str, str, str]],
     task_records: list[list[dict]],
     node_dim: int,
     hidden_dim: int,
     device: torch.device,
     base_state_dict: dict[str, torch.Tensor] | None,
-    correction: nn.Module,
+    correction_module: nn.Module,
     label: str,
     epochs: int,
     batch_size: int,
@@ -883,64 +1064,96 @@ def _frozen_mbj_correction_experiment(
     num_nearest_neighbors: int,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Train a correction module on top of the frozen MBJ parent representation."""
+    """Train a physical-residual correction module on top of the frozen OPT route."""
     prop2id, fid2id = _name_to_id(tasks)
     opt_prop_id = prop2id["band_gap"]
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    base_model = PhyTCAModel(
+    base_model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
 
     start = time.time()
 
     if opt_parent_state is not None:
-        base_model.load_state_dict({k: v.to(device) for k, v in opt_parent_state["state_dict"].items()})
+        base_model.add_task(opt_prop_id, opt_fid_id)
+        base_model.load_state_dict(
+            {k: v.to(device) for k, v in opt_parent_state["state_dict"].items()},
+            strict=False,
+        )
         mean, std, mad = opt_parent_state["mean"], opt_parent_state["std"], opt_parent_state["mad"]
         t1_after_t1 = opt_parent_state["task1_after_task1"]
     else:
         if base_state_dict is not None:
             _load_canonical_base(base_model, base_state_dict, device)
+        base_model.add_task(opt_prop_id, opt_fid_id)
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
         _train_single_task(
-            base_model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-            epochs=epochs, lr=lr, patience=patience,
+            base_model,
+            train_loader,
+            val_loader,
+            opt_prop_id,
+            opt_fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
         )
         dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
         dev_ds.target_mean = float(mean)
         dev_ds.target_std = float(std)
         dev_ds.normalize_target = True
-        dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-        t1_after_t1 = evaluate_loader(base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+        dev_loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        t1_after_t1 = evaluate_loader(
+            base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+        )
 
     task1_stats = (mean, std, mad)
 
     for p in base_model.parameters():
         p.requires_grad = False
 
-    correction_model = FrozenMbjCorrectionModel(
-        base_model, opt_prop_id, opt_fid_id, mbj_fid_id, correction.to(device)
+    correction_model = FrozenOptResidualModel(
+        base_model, opt_prop_id, opt_fid_id, correction_module.to(device)
     ).to(device)
     task2_trainable_names = _trainable_param_names(correction_model)
 
     train_loader2, val_loader2, _, mean2, std2, mad2 = _make_loaders(task_records[1], batch_size)
     task2_stats = (mean2, std2, mad2)
+    correction_model.set_normalizers(mean, std, mean2, std2)
     _train_single_task(
-        correction_model, train_loader2, val_loader2, opt_prop_id, mbj_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        correction_model,
+        train_loader2,
+        val_loader2,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
     result = _run_label_and_metrics(
-        label, correction_model, tasks, task_records, [task1_stats, task2_stats],
-        prop2id, fid2id, batch_size, device, start,
+        label,
+        correction_model,
+        tasks,
+        task_records,
+        [task1_stats, task2_stats],
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["task1_after_task1"] = t1_after_t1
     result["absolute_forgetting"] = result["task1_after_task2"] - t1_after_t1
@@ -965,13 +1178,23 @@ def d6c_independent_low_rank_residual(
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Frozen MBJ parent + low-rank residual on the pooled representation."""
+    """Frozen OPT parent + low-rank residual on the pooled representation."""
     correction = LowRankResidual(hidden_dim=hidden_dim, rank=adapter_rank)
-    return _frozen_mbj_correction_experiment(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        correction=correction, label="fr_phytca_low_rank_residual",
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+    return _frozen_opt_residual_experiment(
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        correction=correction,
+        label="fr_phytca_low_rank_residual",
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
 
@@ -991,15 +1214,27 @@ def d6d_parameter_matched_mlp_residual(
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Frozen MBJ parent + small residual MLP (not matched to FR-PhyTCA)."""
-    # Target parameter count matches the FR-PhyTCA Tucker core increment only.
-    target_params = adapter_rank * (2 * hidden_dim + adapter_rank) + 1
+    """Frozen OPT parent + small residual MLP matched to FR-PhyTCA size."""
+    prop2id, fid2id = _name_to_id(tasks)
+    target_params = _fr_phytca_incremental_params(
+        hidden_dim, adapter_rank, len(prop2id), len(fid2id), n_layers=3
+    )
     correction = _make_parameter_matched_mlp(hidden_dim, target_params)
-    return _frozen_mbj_correction_experiment(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        correction=correction, label="fr_phytca_param_matched_mlp",
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+    return _frozen_opt_residual_experiment(
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        correction=correction,
+        label="fr_phytca_param_matched_mlp",
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
 
@@ -1011,22 +1246,18 @@ def _fr_phytca_incremental_params(
     n_fidelities: int,
     n_layers: int = 3,
 ) -> int:
-    """Incremental parameter count for FR-PhyTCA (child adapters + new head)."""
-    rank_prop = max(2, n_properties)
-    rank_fid = max(2, n_fidelities)
+    """Incremental parameter count for FR-PhyTCA (single-child Tucker + head)."""
+    _ = n_properties, n_fidelities
     per_layer = (
-        hidden_dim * adapter_rank  # U_in
-        + hidden_dim * adapter_rank  # U_out
-        + adapter_rank * adapter_rank * rank_prop * rank_fid  # G
-        + n_properties * rank_prop  # E_prop
-        + n_fidelities * rank_fid  # E_fid
+        hidden_dim * adapter_rank  # u_in
+        + adapter_rank * adapter_rank  # core
+        + hidden_dim * adapter_rank  # u_out
     )
     return n_layers * per_layer + (hidden_dim + 1)  # new head
 
 
 def _find_low_rank_for_target(hidden_dim: int, target_params: int) -> int:
     """Return rank so that LowRankResidual params are within 5% of target."""
-    # Params = rank * (hidden_dim + 1)
     denom = hidden_dim + 1
     ideal = target_params / denom
     candidates = [max(1, int(ideal)), max(1, int(ideal) + 1)]
@@ -1037,7 +1268,6 @@ def _find_low_rank_for_target(hidden_dim: int, target_params: int) -> int:
 
 def _find_mlp_bottleneck_for_target(hidden_dim: int, target_params: int) -> int:
     """Return bottleneck so that two-layer MLP params are within 5% of target."""
-    # Params = (hidden_dim * b + b) + (b * 1 + 1) = b * (hidden_dim + 2) + 1
     denom = hidden_dim + 2
     ideal = (target_params - 1) / denom
     candidates = [max(1, int(ideal)), max(1, int(ideal) + 1)]
@@ -1068,11 +1298,21 @@ def d6g_matched_low_rank_residual(
     )
     rank = _find_low_rank_for_target(hidden_dim, target)
     correction = LowRankResidual(hidden_dim=hidden_dim, rank=rank)
-    result = _frozen_mbj_correction_experiment(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        correction=correction, label="matched_low_rank_residual",
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+    result = _frozen_opt_residual_experiment(
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        correction=correction,
+        label="matched_low_rank_residual",
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
     result["matched_target_params"] = target
@@ -1106,11 +1346,21 @@ def d6h_matched_mlp_residual(
         nn.SiLU(),
         nn.Linear(bottleneck, 1),
     )
-    result = _frozen_mbj_correction_experiment(
-        tasks, task_records, node_dim, hidden_dim, device, base_state_dict,
-        correction=correction, label="matched_mlp_residual",
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience,
-        adapter_rank=adapter_rank, num_nearest_neighbors=num_nearest_neighbors,
+    result = _frozen_opt_residual_experiment(
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        base_state_dict,
+        correction=correction,
+        label="matched_mlp_residual",
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
     )
     result["matched_target_params"] = target
@@ -1119,202 +1369,39 @@ def d6h_matched_mlp_residual(
 
 
 # ---------------------------------------------------------------------------
-# D6: Progressive Tucker residual + optional OPT distillation
+# D6: Progressive Tucker residual (now structural isolation / single-child Tucker)
 # ---------------------------------------------------------------------------
 
 
-class ProgressiveTuckerAdapter(nn.Module):
-    """Parent adapter frozen after Task 1; child adapter is a random-init residual.
-
-    The child uses the default Tucker initialization so that the MBJ fidelity
-    slice can actually learn.  Only the parent OPT slice is forced to zero so
-    the frozen OPT route is not perturbed during Task-2 training.
-    """
-
-    def __init__(
-        self,
-        d_in: int,
-        d_out: int,
-        n_properties: int,
-        n_fidelities: int,
-        rank: int = 8,
-    ) -> None:
-        super().__init__()
-        self.parent = Tucker4DAdapter(
-            d_in, d_out, n_properties, n_fidelities,
-            rank_out=rank, rank_in=rank, rank_prop=max(2, n_properties), rank_fid=max(2, n_fidelities),
-        )
-        self.child = Tucker4DAdapter(
-            d_in, d_out, n_properties, n_fidelities,
-            rank_out=rank, rank_in=rank, rank_prop=max(2, n_properties), rank_fid=max(2, n_fidelities),
-        )
-        # Slices of the child that must remain zero (e.g. the parent OPT slice).
-        self.child_frozen_slices: set[tuple[int, int]] = set()
-
-    def forward(self, x: torch.Tensor, prop_id: int, fid_id: int) -> torch.Tensor:
-        return self.parent(x, prop_id, fid_id) + self.child(x, prop_id, fid_id)
-
-    def freeze_parent_slice(self, prop_id: int, fid_id: int) -> None:
-        self.parent.freeze_slice(prop_id, fid_id)
-
-    def zero_and_freeze_child_slice(self, prop_id: int, fid_id: int) -> None:
-        """Make the child's slice for a parent fidelity permanently zero.
-
-        This guarantees that the OPT forward path does not depend on Task-2
-        updates to the shared child ``U_in``/``U_out`` factors.  We do not set
-        ``requires_grad`` on slices (PyTorch forbids it for non-leaf views);
-        gradients for these slices are zeroed in the post-backward hook.
-        """
-        self.child_frozen_slices.add((int(prop_id), int(fid_id)))
-        with torch.no_grad():
-            self.child.G[:, :, prop_id, fid_id].zero_()
-            self.child.E_prop.weight[prop_id].zero_()
-            self.child.E_fid.weight[fid_id].zero_()
-
-    def zero_child_gradients_for_parent(self) -> None:
-        """Zero gradients that would update the child for already-frozen slices."""
-        if self.child.G.grad is not None:
-            for p, f in self.child_frozen_slices:
-                self.child.G.grad[:, :, p, f].zero_()
-        if self.child.E_prop.weight.grad is not None:
-            for p, _ in self.child_frozen_slices:
-                self.child.E_prop.weight.grad[p].zero_()
-        if self.child.E_fid.weight.grad is not None:
-            for _, f in self.child_frozen_slices:
-                self.child.E_fid.weight.grad[f].zero_()
-
-
-class ProgressiveAdapterCrystalGraphLayer(nn.Module):
-    """Crystal graph layer with a progressive parent+residual Tucker adapter."""
-
-    def __init__(
-        self,
-        dim: int,
-        n_properties: int,
-        n_fidelities: int,
-        rank: int = 8,
-        num_nearest_neighbors: int = 8,
-    ) -> None:
-        super().__init__()
-        self.encoder = AdapterCrystalGraphLayer(dim, n_properties, n_fidelities, rank, num_nearest_neighbors).encoder
-        self.adapter = ProgressiveTuckerAdapter(
-            dim, dim, n_properties, n_fidelities, rank=rank,
-        )
-
-    def forward(
-        self,
-        feats: torch.Tensor,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-        prop_id: int,
-        fid_id: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        new_feats, new_coords = self.encoder(feats, coords, mask=mask)
-        delta = self.adapter(new_feats, prop_id, fid_id)
-        return new_feats + delta, new_coords
-
-
-class ProgressivePhyTCAModel(nn.Module):
-    """PhyTCA variant where each fidelity slice is parent + zero-init residual."""
-
-    def __init__(
-        self,
-        node_dim: int,
-        hidden_dim: int,
-        n_properties: int,
-        n_fidelities: int,
-        n_layers: int = 3,
-        adapter_rank: int = 8,
-        num_nearest_neighbors: int = 8,
-    ) -> None:
-        super().__init__()
-        self.node_dim = node_dim
-        self.hidden_dim = hidden_dim
-        self.n_properties = n_properties
-        self.n_fidelities = n_fidelities
-        self.n_layers = n_layers
-
-        self.node_embed = nn.Linear(node_dim, hidden_dim)
-        self.layers = nn.ModuleList([
-            ProgressiveAdapterCrystalGraphLayer(
-                hidden_dim, n_properties, n_fidelities, rank=adapter_rank,
-                num_nearest_neighbors=num_nearest_neighbors,
-            )
-            for _ in range(n_layers)
-        ])
-        self.heads = nn.ModuleDict()
-        for p in range(n_properties):
-            for f in range(n_fidelities):
-                self.heads[f"p{p}_f{f}"] = nn.Linear(hidden_dim, 1)
-
-        # Keep crystal graph encoder frozen; only adapters/heads are trained.
-        for p in self.encoder_parameters():
-            p.requires_grad = False
-
-    def encoder_parameters(self) -> list[nn.Parameter]:
-        params = list(self.node_embed.parameters())
-        for layer in self.layers:
-            params.extend(layer.encoder.parameters())
-        return params
-
-    def encode(
-        self,
-        node_feats: torch.Tensor,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-        original_mask: torch.Tensor,
-        prop_id: int,
-        fid_id: int,
-    ) -> torch.Tensor:
-        h = self.node_embed(node_feats)
-        for layer in self.layers:
-            h, coords = layer(h, coords, mask, prop_id, fid_id)
-        mask_exp = original_mask.unsqueeze(-1).float()
-        return (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1).clamp_min(1.0))
-
-    def forward(
-        self,
-        node_feats: torch.Tensor,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-        original_mask: torch.Tensor,
-        prop_id: int,
-        fid_id: int,
-    ) -> torch.Tensor:
-        pooled = self.encode(node_feats, coords, mask, original_mask, prop_id, fid_id)
-        return self.heads[f"p{prop_id}_f{fid_id}"](pooled).squeeze(-1)
-
-    def freeze_parent_task(self, prop_id: int, fid_id: int) -> None:
-        """Freeze the parent adapter slice and the corresponding head."""
-        for layer in self.layers:
-            layer.adapter.freeze_parent_slice(prop_id, fid_id)
-            # Zero-grad guard for the child is handled by the post-backward hook.
-        for p in self.heads[f"p{prop_id}_f{fid_id}"].parameters():
-            p.requires_grad = False
-
-        # Freeze all parent adapter parameters.
-        for layer in self.layers:
-            for p in layer.adapter.parent.parameters():
-                p.requires_grad = False
-
-    def count_trainable(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def count_total(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-def _remap_phytca_to_progressive_state(
-    state_dict: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Map a PhyTCAModel state dict into a ProgressivePhyTCAModel parent state."""
-    remapped: dict[str, torch.Tensor] = {}
-    for k, v in state_dict.items():
-        if k.startswith("layers.") and ".adapter." in k:
-            remapped[k.replace(".adapter.", ".adapter.parent.", 1)] = v
-        else:
-            remapped[k] = v
-    return remapped
+def _snapshot_opt_predictions(
+    model: ContinualCrystalModel,
+    task_records: list[list[dict]],
+    opt_prop_id: int,
+    opt_fid_id: int,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return normalized OPT predictions on the continual_dev split."""
+    dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
+    dev_ds.target_mean = float(mean)
+    dev_ds.target_std = float(std)
+    dev_ds.normalize_target = True
+    dev_loader = DataLoader(
+        dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+    )
+    preds: list[torch.Tensor] = []
+    model.eval()
+    with torch.no_grad():
+        for node_feats, coords, mask, original_mask, _ in dev_loader:
+            node_feats = node_feats.to(device)
+            coords = coords.to(device)
+            mask = mask.to(device)
+            original_mask = original_mask.to(device)
+            pred = model(node_feats, coords, mask, original_mask, opt_prop_id, opt_fid_id)
+            preds.append(pred.detach().cpu())
+    return torch.cat(preds)
 
 
 def d6_progressive_tucker(
@@ -1335,224 +1422,134 @@ def d6_progressive_tucker(
     adapter_rank: int = 8,
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
+    experiment_label: str | None = None,
+    adapter_name: str = "single_child_tucker",
 ) -> dict[str, Any]:
-    """Progressive Tucker residual with optional OPT distillation.
+    """FR-PhyTCA via exact-retention structural isolation.
 
-    When ``opt_parent_state`` is provided, the OPT parent is loaded from that
-    shared checkpoint instead of being trained again, so D4/D5/D6 share the
-    exact same frozen OPT route.
+    The old progressive Tucker parent/child construction is replaced by
+    ``ContinualCrystalModel``: each task has a private adapter bank, and
+    freezing the old bank guarantees zero drift of the OPT route.
 
-    Ablations:
-        - ``orthogonal_child``: project child ``U_in``/``U_out`` to be orthogonal
-          to the parent factors (no distillation).
-        - ``shared_factors``: tie child ``U_in``/``U_out`` to the frozen parent
-          factors and optionally unfreeze the top encoder layer.
+    The ``orthogonal_child``, ``shared_factors``, and ``unfreeze_top_layer``
+    flags are kept for API compatibility but are no-ops in the new design:
+    structural isolation already enforces the invariant they were meant to
+    approximate.  ``lambda_distill`` is also ignored because the parent route
+    is physically frozen, so distillation is redundant.
     """
-    if orthogonal_child and shared_factors:
-        raise ValueError("orthogonal_child and shared_factors are mutually exclusive")
+    _ = lambda_distill, orthogonal_child, shared_factors, unfreeze_top_layer
     prop2id, fid2id = _name_to_id(tasks)
     opt_prop_id = prop2id["band_gap"]
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    model = ProgressivePhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name=adapter_name,
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
     ).to(device)
+
+    if base_state_dict is not None:
+        _load_canonical_base(model, base_state_dict, device)
 
     start = time.time()
 
     if opt_parent_state is not None:
-        parent_state = _remap_phytca_to_progressive_state(opt_parent_state["state_dict"])
-        model.load_state_dict({k: v.to(device) for k, v in parent_state.items()}, strict=False)
-        for layer in model.layers:
-            layer.adapter.zero_and_freeze_child_slice(opt_prop_id, opt_fid_id)
+        model.add_task(opt_prop_id, opt_fid_id)
+        model.load_state_dict(
+            {k: v.to(device) for k, v in opt_parent_state["state_dict"].items()},
+            strict=False,
+        )
         mean, std, mad = opt_parent_state["mean"], opt_parent_state["std"], opt_parent_state["mad"]
         t1_after_t1 = opt_parent_state["task1_after_task1"]
     else:
-        if base_state_dict is not None:
-            encoder_state = {k: v for k, v in base_state_dict.items() if "adapter" not in k}
-            parent_state = {}
-            for k, v in base_state_dict.items():
-                if "adapter" in k:
-                    parent_key = k.replace("adapter.", "adapter.parent.", 1)
-                    parent_state[parent_key] = v
-            mapped_state = {**encoder_state, **parent_state}
-            _load_canonical_base(model, mapped_state, device)
-
-        # Make the child's OPT slice permanently zero so the OPT path stays pure parent.
-        for layer in model.layers:
-            layer.adapter.zero_and_freeze_child_slice(opt_prop_id, opt_fid_id)
-
-        # Task 1: train OPT parent only (child frozen).
-        for layer in model.layers:
-            for p in layer.adapter.child.parameters():
-                p.requires_grad = False
-
+        model.add_task(opt_prop_id, opt_fid_id)
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
         _train_single_task(
-            model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-            epochs=epochs, lr=lr, patience=patience,
+            model,
+            train_loader,
+            val_loader,
+            opt_prop_id,
+            opt_fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
         )
-
         dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
         dev_ds.target_mean = float(mean)
         dev_ds.target_std = float(std)
         dev_ds.normalize_target = True
-        dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-        t1_after_t1 = evaluate_loader(model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+        dev_loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        t1_after_t1 = evaluate_loader(
+            model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+        )
 
     task1_stats = (mean, std, mad)
 
-    # Freeze parent and enable child.
-    model.freeze_parent_task(opt_prop_id, opt_fid_id)
+    # Exact-retention gate: snapshot OPT predictions before freezing/adding MBJ.
+    opt_preds_before = _snapshot_opt_predictions(
+        model, task_records, opt_prop_id, opt_fid_id, mean, std, batch_size, device
+    )
 
-    if orthogonal_child:
-        _orthogonalize_child_factors(model)
-    if shared_factors:
-        _tie_child_factors_to_parent(model)
-    if unfreeze_top_layer:
-        for p in model.layers[-1].encoder.parameters():
-            p.requires_grad = True
+    # Freeze the OPT task; its adapter bank and head are excluded from all
+    # future optimizers by structural isolation.
+    model.freeze_task(opt_prop_id, opt_fid_id)
 
-    for layer in model.layers:
-        # The OPT slice of the child core/embedding is kept zero by the guard;
-        # MBJ slice uses these parameters freely.
-        layer.adapter.child.G.requires_grad = True
-        layer.adapter.child.E_prop.weight.requires_grad = True
-        layer.adapter.child.E_fid.weight.requires_grad = True
-        if not shared_factors:
-            layer.adapter.child.U_in.requires_grad = True
-            layer.adapter.child.U_out.requires_grad = True
-    # Unfreeze MBJ head.
-    for p in model.heads[f"p{opt_prop_id}_f{mbj_fid_id}"].parameters():
-        p.requires_grad = True
-
-    task2_trainable_names = _trainable_param_names(model)
-
-    # Snapshot OPT predictions before Task 2 for the invariance gate.
-    dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
-    dev_ds.target_mean = float(mean)
-    dev_ds.target_std = float(std)
-    dev_ds.normalize_target = True
-    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-    opt_preds_before: list[torch.Tensor] = []
-    model.eval()
-    with torch.no_grad():
-        for node_feats, coords, mask, original_mask, _ in dev_loader:
-            node_feats = node_feats.to(device)
-            coords = coords.to(device)
-            mask = mask.to(device)
-            original_mask = original_mask.to(device)
-            pred = model(node_feats, coords, mask, original_mask, opt_prop_id, opt_fid_id)
-            opt_preds_before.append(pred.detach().cpu())
-    opt_preds_before = torch.cat(opt_preds_before)
-
-    # Task 2: train child residual (+ optional distillation).
+    # Task 2: add a fresh MBJ adapter bank + head and train it.
+    model.add_task(opt_prop_id, mbj_fid_id)
     train_loader2, val_loader2, _, mean2, std2, mad2 = _make_loaders(task_records[1], batch_size)
     task2_stats = (mean2, std2, mad2)
-
-    teacher_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-    teacher = ProgressivePhyTCAModel(
-        node_dim=node_dim,
-        hidden_dim=hidden_dim,
-        n_properties=len(prop2id),
-        n_fidelities=len(fid2id),
-        n_layers=3,
-        adapter_rank=adapter_rank,
-        num_nearest_neighbors=num_nearest_neighbors,
-    ).to(device)
-    teacher.load_state_dict({k: v.to(device) for k, v in teacher_state.items()})
-    for p in teacher.parameters():
-        p.requires_grad = False
-    teacher.eval()
-
-    def post_backward(m: nn.Module) -> None:
-        for layer in m.layers:
-            layer.adapter.zero_child_gradients_for_parent()
-
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=1e-4
+    _train_single_task(
+        model,
+        train_loader2,
+        val_loader2,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    best_nmae = float("inf")
-    best_state = None
-    patience_counter = 0
 
-    for _ in range(epochs):
-        model.train()
-        for node_feats, coords, mask, original_mask, y in train_loader2:
-            node_feats = node_feats.to(device)
-            coords = coords.to(device)
-            mask = mask.to(device)
-            original_mask = original_mask.to(device)
-            y_norm = ((y.to(device) - mean2.to(device)) / std2.to(device)).float()
-
-            optimizer.zero_grad()
-            pred_mbj = model(node_feats, coords, mask, original_mask, opt_prop_id, mbj_fid_id)
-            loss = F.mse_loss(pred_mbj, y_norm)
-
-            if lambda_distill > 0.0:
-                with torch.no_grad():
-                    teacher_opt = teacher(node_feats, coords, mask, original_mask, opt_prop_id, opt_fid_id)
-                pred_opt = model(node_feats, coords, mask, original_mask, opt_prop_id, opt_fid_id)
-                loss += lambda_distill * F.smooth_l1_loss(pred_opt, teacher_opt)
-
-            loss.backward()
-            post_backward(model)
-            optimizer.step()
-
-        val_nmae = evaluate_loader(model, val_loader2, opt_prop_id, mbj_fid_id, mean2, std2, mad2, device)
-        if val_nmae < best_nmae:
-            best_nmae = val_nmae
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        scheduler.step()
-        if patience_counter >= patience:
-            break
-
-    if best_state is not None:
-        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-
-    # OPT route invariance gate: predictions must be identical before/after Task 2.
-    opt_preds_after: list[torch.Tensor] = []
-    model.eval()
-    with torch.no_grad():
-        for node_feats, coords, mask, original_mask, _ in dev_loader:
-            node_feats = node_feats.to(device)
-            coords = coords.to(device)
-            mask = mask.to(device)
-            original_mask = original_mask.to(device)
-            pred = model(node_feats, coords, mask, original_mask, opt_prop_id, opt_fid_id)
-            opt_preds_after.append(pred.detach().cpu())
-    opt_preds_after = torch.cat(opt_preds_after)
+    # Exact-retention gate: OPT predictions must be identical after Task 2.
+    opt_preds_after = _snapshot_opt_predictions(
+        model, task_records, opt_prop_id, opt_fid_id, mean, std, batch_size, device
+    )
     opt_route_drift = float((opt_preds_after - opt_preds_before).abs().max())
 
-    task_stats = [task1_stats, task2_stats]
-    label = "fr_phytca"
-    if orthogonal_child:
-        label += "_orthogonal"
-    if shared_factors:
-        label += "_shared_factor_top_layer"
-    if lambda_distill > 0.0:
-        label += f"_distill_{lambda_distill}"
+    nmaes = [
+        _evaluate_on_dev(
+            model, tasks, task_records, [task1_stats], prop2id, fid2id, batch_size, device, 0
+        ),
+        _evaluate_on_dev(
+            model,
+            tasks,
+            task_records,
+            [task1_stats, task2_stats],
+            prop2id,
+            fid2id,
+            batch_size,
+            device,
+            1,
+        ),
+    ]
+
+    label = experiment_label or "fr_phytca"
     result = _run_label_and_metrics(
-        label, model, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start,
+        label, model, tasks, task_records, [task1_stats, task2_stats], prop2id, fid2id, batch_size, device, start, nmaes=nmaes
     )
     result["task1_after_task1"] = t1_after_t1
     result["absolute_forgetting"] = result["task1_after_task2"] - t1_after_t1
     result["bwt"] = backward_transfer([[t1_after_t1], result["nmaes"][1]])
-    result["incremental_params"] = result["trainable_params"]
-    result["task2_trainable_param_names"] = task2_trainable_names
+    result["incremental_params"] = model.count_incremental_parameters(opt_prop_id, mbj_fid_id)
     result["opt_route_drift"] = opt_route_drift
     return result
 
@@ -1572,7 +1569,7 @@ def d6e_orthogonal_tucker_residual(
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """FR-PhyTCA with child Tucker factors orthogonal to the parent factors."""
+    """FR-PhyTCA variant with the orthogonal-child label (now a structural alias)."""
     return d6_progressive_tucker(
         tasks=tasks,
         task_records=task_records,
@@ -1584,11 +1581,10 @@ def d6e_orthogonal_tucker_residual(
         batch_size=batch_size,
         lr=lr,
         patience=patience,
-        lambda_distill=0.0,
-        orthogonal_child=True,
         adapter_rank=adapter_rank,
         num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
+        experiment_label="fr_phytca_orthogonal",
     )
 
 
@@ -1607,7 +1603,7 @@ def d6f_shared_factor_top_layer(
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """FR-PhyTCA with shared Tucker factors and a trainable top encoder layer."""
+    """FR-PhyTCA variant with the shared-factor-top-layer label (structural alias)."""
     return d6_progressive_tucker(
         tasks=tasks,
         task_records=task_records,
@@ -1619,30 +1615,134 @@ def d6f_shared_factor_top_layer(
         batch_size=batch_size,
         lr=lr,
         patience=patience,
-        lambda_distill=0.0,
-        shared_factors=True,
-        unfreeze_top_layer=True,
         adapter_rank=adapter_rank,
         num_nearest_neighbors=num_nearest_neighbors,
         opt_parent_state=opt_parent_state,
+        experiment_label="fr_phytca_shared_factor_top_layer",
     )
 
 
 # ---------------------------------------------------------------------------
-# Additional baselines for 5k scaling study
+# D6i-k: architecture-matched adapter baselines
+# ---------------------------------------------------------------------------
+
+
+def d6i_lora_ab(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    base_state_dict: dict[str, torch.Tensor] | None = None,
+    epochs: int = 10,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    patience: int = 3,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+    opt_parent_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """FR-PhyTCA-style training with ``adapter_name='lora_ab'``."""
+    return d6_progressive_tucker(
+        tasks=tasks,
+        task_records=task_records,
+        node_dim=node_dim,
+        hidden_dim=hidden_dim,
+        device=device,
+        base_state_dict=base_state_dict,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+        opt_parent_state=opt_parent_state,
+        experiment_label="fr_phytca_lora_ab",
+        adapter_name="lora_ab",
+    )
+
+
+def d6j_lora_aba(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    base_state_dict: dict[str, torch.Tensor] | None = None,
+    epochs: int = 10,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    patience: int = 3,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+    opt_parent_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """FR-PhyTCA-style training with ``adapter_name='lora_aba'``."""
+    return d6_progressive_tucker(
+        tasks=tasks,
+        task_records=task_records,
+        node_dim=node_dim,
+        hidden_dim=hidden_dim,
+        device=device,
+        base_state_dict=base_state_dict,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+        opt_parent_state=opt_parent_state,
+        experiment_label="fr_phytca_lora_aba",
+        adapter_name="lora_aba",
+    )
+
+
+def d6k_multi_axis_tucker(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    base_state_dict: dict[str, torch.Tensor] | None = None,
+    epochs: int = 10,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    patience: int = 3,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+    opt_parent_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """FR-PhyTCA-style training with ``adapter_name='multi_axis_tucker'``."""
+    return d6_progressive_tucker(
+        tasks=tasks,
+        task_records=task_records,
+        node_dim=node_dim,
+        hidden_dim=hidden_dim,
+        device=device,
+        base_state_dict=base_state_dict,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+        opt_parent_state=opt_parent_state,
+        experiment_label="fr_phytca_multi_axis_tucker",
+        adapter_name="multi_axis_tucker",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Additional baselines for scaling study
 # ---------------------------------------------------------------------------
 
 
 class FeatureTransferModel(nn.Module):
-    """Freeze OPT route and train an MBJ head on concatenated OPT+MBJ representations.
-
-    This baseline distinguishes output-delta transfer (D5), latent-feature
-    transfer (this model), and structured tensor residuals (FR-PhyTCA).
-    """
+    """Freeze OPT route and train an MBJ head on concatenated OPT+MBJ representations."""
 
     def __init__(
         self,
-        base_model: PhyTCAModel,
+        base_model: ContinualCrystalModel,
         opt_prop_id: int,
         opt_fid_id: int,
         mbj_fid_id: int,
@@ -1658,6 +1758,8 @@ class FeatureTransferModel(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
+        for p in self.base.parameters():
+            p.requires_grad = False
 
     def forward(
         self,
@@ -1672,7 +1774,8 @@ class FeatureTransferModel(nn.Module):
             node_feats, coords, mask, original_mask, prop_id, self.opt_fid_id
         )
         if fid_id == self.opt_fid_id:
-            return self.base.heads[f"p{prop_id}_f{self.opt_fid_id}"](h_opt).squeeze(-1)
+            key = self.base._task_key(prop_id, self.opt_fid_id)
+            return self.base.heads[key](h_opt).squeeze(-1)
         h_mbj = self.base.encode(
             node_feats, coords, mask, original_mask, prop_id, self.mbj_fid_id
         )
@@ -1700,56 +1803,92 @@ def feature_transfer_experiment(
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    base_model = PhyTCAModel(
+    base_model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
 
     start = time.time()
 
     if opt_parent_state is not None:
-        base_model.load_state_dict({k: v.to(device) for k, v in opt_parent_state["state_dict"].items()})
+        base_model.add_task(opt_prop_id, opt_fid_id)
+        base_model.load_state_dict(
+            {k: v.to(device) for k, v in opt_parent_state["state_dict"].items()},
+            strict=False,
+        )
         mean, std, mad = opt_parent_state["mean"], opt_parent_state["std"], opt_parent_state["mad"]
         t1_after_t1 = opt_parent_state["task1_after_task1"]
     else:
         if base_state_dict is not None:
             _load_canonical_base(base_model, base_state_dict, device)
+        base_model.add_task(opt_prop_id, opt_fid_id)
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
         _train_single_task(
-            base_model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-            epochs=epochs, lr=lr, patience=patience,
+            base_model,
+            train_loader,
+            val_loader,
+            opt_prop_id,
+            opt_fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
         )
         dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
         dev_ds.target_mean = float(mean)
         dev_ds.target_std = float(std)
         dev_ds.normalize_target = True
-        dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-        t1_after_t1 = evaluate_loader(base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+        dev_loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        t1_after_t1 = evaluate_loader(
+            base_model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+        )
 
     task1_stats = (mean, std, mad)
 
     for p in base_model.parameters():
         p.requires_grad = False
 
-    ft_model = FeatureTransferModel(base_model, opt_prop_id, opt_fid_id, mbj_fid_id).to(device)
+    # Add an untrained MBJ route so its representation can be used by the head.
+    base_model.add_task(opt_prop_id, mbj_fid_id)
+
+    ft_model = FeatureTransferModel(
+        base_model, opt_prop_id, opt_fid_id, mbj_fid_id
+    ).to(device)
     task2_trainable_names = _trainable_param_names(ft_model)
 
     train_loader2, val_loader2, _, mean2, std2, mad2 = _make_loaders(task_records[1], batch_size)
     task2_stats = (mean2, std2, mad2)
     _train_single_task(
-        ft_model, train_loader2, val_loader2, opt_prop_id, mbj_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        ft_model,
+        train_loader2,
+        val_loader2,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
     result = _run_label_and_metrics(
-        "feature_transfer", ft_model, tasks, task_records, [task1_stats, task2_stats],
-        prop2id, fid2id, batch_size, device, start,
+        "feature_transfer",
+        ft_model,
+        tasks,
+        task_records,
+        [task1_stats, task2_stats],
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["task1_after_task1"] = t1_after_t1
     result["absolute_forgetting"] = result["task1_after_task2"] - t1_after_t1
@@ -1779,31 +1918,49 @@ def mbj_only_training(
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
     ).to(device)
     if base_state_dict is not None:
         _load_canonical_base(model, base_state_dict, device)
 
     start = time.time()
+    # Add an untrained OPT route and the MBJ task to be trained.
+    model.add_task(opt_prop_id, opt_fid_id)
+    model.add_task(opt_prop_id, mbj_fid_id)
+
     train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[1], batch_size)
     _train_single_task(
-        model, train_loader, val_loader, opt_prop_id, mbj_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        model,
+        train_loader,
+        val_loader,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
-    # Evaluate on both tasks using the single trained model.
     task_stats = [(mean, std, mad), (mean, std, mad)]
     result = _run_label_and_metrics(
-        "mbj_only", model, tasks, task_records, task_stats,
-        prop2id, fid2id, batch_size, device, start,
+        "mbj_only",
+        model,
+        tasks,
+        task_records,
+        task_stats,
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["incremental_params"] = result["trainable_params"]
     return result
@@ -1824,60 +1981,92 @@ def opt_pretrain_mbj_full_finetune(
     num_nearest_neighbors: int = 8,
     opt_parent_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Pre-train on OPT, then full fine-tune on MBJ (shows catastrophic forgetting)."""
+    """Pre-train on OPT, then unfreeze everything and fine-tune on MBJ."""
     prop2id, fid2id = _name_to_id(tasks)
     opt_prop_id = prop2id["band_gap"]
     opt_fid_id = fid2id["OptB88vdW"]
     mbj_fid_id = fid2id["TB-mBJ"]
 
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=len(prop2id),
         n_fidelities=len(fid2id),
-        n_layers=3,
+        adapter_name="single_child_tucker",
         adapter_rank=adapter_rank,
+        n_layers=3,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=False,
     ).to(device)
 
     start = time.time()
 
     if opt_parent_state is not None:
-        model.load_state_dict({k: v.to(device) for k, v in opt_parent_state["state_dict"].items()})
+        model.add_task(opt_prop_id, opt_fid_id)
+        model.load_state_dict(
+            {k: v.to(device) for k, v in opt_parent_state["state_dict"].items()},
+            strict=False,
+        )
         mean, std, mad = opt_parent_state["mean"], opt_parent_state["std"], opt_parent_state["mad"]
         t1_after_t1 = opt_parent_state["task1_after_task1"]
     else:
         if base_state_dict is not None:
             _load_canonical_base(model, base_state_dict, device)
+        model.add_task(opt_prop_id, opt_fid_id)
         train_loader, val_loader, _, mean, std, mad = _make_loaders(task_records[0], batch_size)
         _train_single_task(
-            model, train_loader, val_loader, opt_prop_id, opt_fid_id, device,
-            epochs=epochs, lr=lr, patience=patience,
+            model,
+            train_loader,
+            val_loader,
+            opt_prop_id,
+            opt_fid_id,
+            device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
         )
         dev_ds = JARVISCrystalDataset(task_records[0], split="continual_dev")
         dev_ds.target_mean = float(mean)
         dev_ds.target_std = float(std)
         dev_ds.normalize_target = True
-        dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals)
-        t1_after_t1 = evaluate_loader(model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device)
+        dev_loader = DataLoader(
+            dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        t1_after_t1 = evaluate_loader(
+            model, dev_loader, opt_prop_id, opt_fid_id, mean, std, mad, device
+        )
 
     task1_stats = (mean, std, mad)
 
-    # Unfreeze everything for full MBJ fine-tuning.
+    # Unfreeze everything for full MBJ fine-tuning (demonstrates forgetting).
     for p in model.parameters():
         p.requires_grad = True
 
+    model.add_task(opt_prop_id, mbj_fid_id)
     train_loader2, val_loader2, _, mean2, std2, mad2 = _make_loaders(task_records[1], batch_size)
     task2_stats = (mean2, std2, mad2)
     _train_single_task(
-        model, train_loader2, val_loader2, opt_prop_id, mbj_fid_id, device,
-        epochs=epochs, lr=lr, patience=patience,
+        model,
+        train_loader2,
+        val_loader2,
+        opt_prop_id,
+        mbj_fid_id,
+        device,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
     )
 
     result = _run_label_and_metrics(
-        "opt_pretrain_mbj_full_finetune", model, tasks, task_records, [task1_stats, task2_stats],
-        prop2id, fid2id, batch_size, device, start,
+        "opt_pretrain_mbj_full_finetune",
+        model,
+        tasks,
+        task_records,
+        [task1_stats, task2_stats],
+        prop2id,
+        fid2id,
+        batch_size,
+        device,
+        start,
     )
     result["task1_after_task1"] = t1_after_t1
     result["absolute_forgetting"] = result["task1_after_task2"] - t1_after_t1
@@ -1898,4 +2087,16 @@ DIAGNOSTIC_REGISTRY: dict[str, Callable] = {
     "frozen_opt_affine_correction": d4_frozen_opt_affine,
     "frozen_opt_residual_correction": d5_frozen_opt_residual,
     "fr_phytca": d6_progressive_tucker,
+    "fr_phytca_orthogonal": d6e_orthogonal_tucker_residual,
+    "fr_phytca_shared_factor_top_layer": d6f_shared_factor_top_layer,
+    "fr_phytca_low_rank_residual": d6c_independent_low_rank_residual,
+    "fr_phytca_param_matched_mlp": d6d_parameter_matched_mlp_residual,
+    "matched_low_rank_residual": d6g_matched_low_rank_residual,
+    "matched_mlp_residual": d6h_matched_mlp_residual,
+    "fr_phytca_lora_ab": d6i_lora_ab,
+    "fr_phytca_lora_aba": d6j_lora_aba,
+    "fr_phytca_multi_axis_tucker": d6k_multi_axis_tucker,
+    "feature_transfer": feature_transfer_experiment,
+    "mbj_only": mbj_only_training,
+    "opt_pretrain_mbj_full_finetune": opt_pretrain_mbj_full_finetune,
 }

@@ -17,7 +17,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from data import JARVISCrystalDataset, collate_crystals
 from phytca import PhyTCAModel, compute_mad, normalized_mae
-from train_phytca import _name_to_id, evaluate_loader
+from train_phytca import _name_to_id, continual_experiment, evaluate_loader
 
 
 # ---------------------------------------------------------------------------
@@ -800,6 +800,168 @@ def shared_lora_bank(
 
 
 # ---------------------------------------------------------------------------
+# 9. Architecture-matched FR-PhyTCA baselines (new ContinualCrystalModel)
+# ---------------------------------------------------------------------------
+
+
+def _fr_phytca_baseline(
+    adapter_name: str,
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+) -> tuple[list[list[float]], dict]:
+    """Run ``train_phytca.continual_experiment`` with the requested adapter."""
+    return continual_experiment(
+        tasks=tasks,
+        task_records=task_records,
+        node_dim=node_dim,
+        hidden_dim=hidden_dim,
+        device=device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        adapter_name=adapter_name,
+        adapter_rank=adapter_rank,
+        n_layers=3,
+        num_nearest_neighbors=num_nearest_neighbors,
+        update_coors=False,
+    )
+
+
+def fr_lora_ab(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+) -> tuple[list[list[float]], dict]:
+    """FR-PhyTCA-style training with LoRA-AB adapters."""
+    return _fr_phytca_baseline(
+        "lora_ab",
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+    )
+
+
+def fr_lora_aba(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+) -> tuple[list[list[float]], dict]:
+    """FR-PhyTCA-style training with LoRA-ABA adapters."""
+    return _fr_phytca_baseline(
+        "lora_aba",
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+    )
+
+
+def fr_single_child_tucker(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+) -> tuple[list[list[float]], dict]:
+    """FR-PhyTCA: exact-retention continual learning with single-child Tucker."""
+    return _fr_phytca_baseline(
+        "single_child_tucker",
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+    )
+
+
+def fr_multi_axis_tucker(
+    tasks: list[tuple[str, str, str]],
+    task_records: list[list[dict]],
+    node_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    adapter_rank: int = 8,
+    num_nearest_neighbors: int = 8,
+) -> tuple[list[list[float]], dict]:
+    """FR-PhyTCA-style training with full multi-axis Tucker adapters.
+
+    This is most meaningful when ``n_properties >= 2`` or ``n_fidelities >= 3``;
+    otherwise the property/fidelity modes have nothing to share across.
+    """
+    return _fr_phytca_baseline(
+        "multi_axis_tucker",
+        tasks,
+        task_records,
+        node_dim,
+        hidden_dim,
+        device,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        adapter_rank=adapter_rank,
+        num_nearest_neighbors=num_nearest_neighbors,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner helpers
 # ---------------------------------------------------------------------------
 
@@ -814,4 +976,8 @@ BASELINE_REGISTRY: dict[str, Callable] = {
     "replay": experience_replay,
     "independent_lora": independent_lora,
     "shared_lora": shared_lora_bank,
+    "fr_lora_ab": fr_lora_ab,
+    "fr_lora_aba": fr_lora_aba,
+    "fr_single_child_tucker": fr_single_child_tucker,
+    "fr_multi_axis_tucker": fr_multi_axis_tucker,
 }

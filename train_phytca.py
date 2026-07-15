@@ -1,4 +1,17 @@
-"""Continual learning training script for PhyTCA on JARVIS crystals."""
+"""Continual learning training script for exact-retention crystal models.
+
+This script uses ``models.ContinualCrystalModel`` and the adapter zoo from
+``adapters.py``.  It enforces exact retention by structural isolation: each
+(property, fidelity) task owns a private adapter bank + head, and old tasks are
+frozen by ``requires_grad=False`` and excluded from the optimizer.
+
+Normalization policy (addresses 反馈_2.md 5.1):
+* Each fidelity is normalized with its own training-set mean/std.
+* The model predicts child-normalized targets directly; no parent and child
+  normalized quantities are added.
+* Correction baselines that explicitly add parent + residual must use
+  ``models.PredictionResidualHead`` to work in physical units.
+"""
 
 from __future__ import annotations
 
@@ -15,8 +28,8 @@ from data import (
     build_protocol_b,
     collate_crystals,
 )
-from phytca import (
-    PhyTCAModel,
+from models import (
+    ContinualCrystalModel,
     backward_transfer,
     compute_mad,
     forgetting,
@@ -37,7 +50,7 @@ def _name_to_id(tasks: list[tuple[str, str, str]]) -> tuple[dict[str, int], dict
 
 
 def _last_occurrences(tasks: list[tuple[str, str, str]]) -> set[tuple[int, int]]:
-    """Return (prop_id, fid_id) pairs that appear for the last time at their index."""
+    """Return task indices that are the last occurrence of their (prop, fid)."""
     prop2id, fid2id = _name_to_id(tasks)
     last: dict[tuple[int, int], int] = {}
     for t, (_, p, f) in enumerate(tasks):
@@ -46,7 +59,7 @@ def _last_occurrences(tasks: list[tuple[str, str, str]]) -> set[tuple[int, int]]
 
 
 def evaluate_loader(
-    model: PhyTCAModel,
+    model: ContinualCrystalModel,
     loader: DataLoader,
     prop_id: int,
     fid_id: int,
@@ -73,64 +86,22 @@ def evaluate_loader(
     return float(normalized_mae(preds, targets, mad))
 
 
-def _gradient_norms_by_group(model: PhyTCAModel) -> dict[str, float]:
-    """Return L2 gradient norms grouped by parameter role."""
-    groups: dict[str, list[torch.Tensor]] = {
-        "node_embed": [],
-        "egnn_backbone": [],
-        "adapter_U": [],
-        "adapter_core_G": [],
-        "adapter_E_prop": [],
-        "adapter_E_fid": [],
-        "heads": [],
-    }
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
-        if "node_embed" in name:
-            groups["node_embed"].append(p.grad)
-        elif any(x in name for x in (".egnn.", "edge_mlp", "coors_mlp", "node_mlp")):
-            groups["egnn_backbone"].append(p.grad)
-        elif "U_out" in name or "U_in" in name:
-            groups["adapter_U"].append(p.grad)
-        elif ".G" in name:
-            groups["adapter_core_G"].append(p.grad)
-        elif "E_prop" in name:
-            groups["adapter_E_prop"].append(p.grad)
-        elif "E_fid" in name:
-            groups["adapter_E_fid"].append(p.grad)
-        elif "heads" in name:
-            groups["heads"].append(p.grad)
-        else:
-            groups.setdefault("other", []).append(p.grad)
-    return {
-        k: float(torch.sqrt(torch.stack([g.pow(2).sum() for g in v]).sum())) if v else 0.0
-        for k, v in groups.items()
-    }
-
-
 def train_task(
-    model: PhyTCAModel,
+    model: ContinualCrystalModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
     prop_id: int,
     fid_id: int,
-    anchor: dict,
     device: torch.device,
     epochs: int = 20,
     lr: float = 1e-3,
-    mu: float = 0.01,
+    weight_decay: float = 1e-4,
     patience: int = 5,
-    log_gradients: bool = False,
 ) -> tuple[float, torch.Tensor, torch.Tensor, float]:
-    """Train one continual task and return best validation nMAE + normalization stats."""
-    model.train()
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=1e-4
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    """Train one continual task and return best validation nMAE + stats."""
+    model.add_task(prop_id, fid_id)
 
-    # Normalize targets using training data statistics.
+    # Use training-set statistics for normalization.
     all_targets = []
     for _, _, _, _, y in train_loader:
         all_targets.append(y)
@@ -139,13 +110,23 @@ def train_task(
     target_std = all_targets.std().clamp_min(1e-6)
     mad = compute_mad(all_targets)
 
+    trainable = model.current_trainable_parameters()
+    if not trainable:
+        raise RuntimeError(
+            f"No trainable parameters for task (prop={prop_id}, fid={fid_id}); "
+            "the task may have been frozen already."
+        )
+
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
     best_nmae = float("inf")
     best_state = None
     patience_counter = 0
 
-    for epoch in range(epochs):
+    for _ in range(epochs):
         model.train()
-        for batch_idx, (node_feats, coords, mask, original_mask, y) in enumerate(train_loader):
+        for node_feats, coords, mask, original_mask, y in train_loader:
             node_feats = node_feats.to(device)
             coords = coords.to(device)
             mask = mask.to(device)
@@ -155,21 +136,12 @@ def train_task(
             optimizer.zero_grad()
             pred = model(node_feats, coords, mask, original_mask, prop_id, fid_id)
             loss = F.mse_loss(pred, y_norm)
-            loss += model.stability_loss(mu, anchor)
             loss.backward()
-            # Zero gradients of frozen adapter slices.
-            for layer in model.layers:
-                layer.adapter.zero_frozen_gradients()
-            if log_gradients and batch_idx == 0:
-                norms = _gradient_norms_by_group(model)
-                print(f"    grad norms @ epoch {epoch + 1}: {norms}")
             optimizer.step()
 
-        # Validation.
         val_nmae = evaluate_loader(
             model, val_loader, prop_id, fid_id, target_mean, target_std, mad, device
         )
-
         if val_nmae < best_nmae:
             best_nmae = val_nmae
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -196,37 +168,38 @@ def continual_experiment(
     epochs: int = 20,
     batch_size: int = 32,
     lr: float = 1e-3,
-    mu: float = 0.01,
+    weight_decay: float = 1e-4,
+    adapter_name: str = "single_child_tucker",
     adapter_rank: int = 8,
+    n_layers: int = 3,
     num_nearest_neighbors: int = 8,
-    log_gradients: bool = False,
+    update_coors: bool = False,
 ) -> tuple[list[list[float]], dict]:
     """Run sequential continual learning over JARVIS (property, fidelity) tasks.
 
     Tasks that share the same (property, fidelity) are treated as data-
-    incremental snapshots: the adapter slice, property/fidelity embeddings, and
-    prediction head are not frozen between them.
+    incremental snapshots: they reuse the same adapter bank and head and are
+    frozen only after the last occurrence.
     """
     prop2id, fid2id = _name_to_id(tasks)
     n_props = len(prop2id)
     n_fids = len(fid2id)
-    model = PhyTCAModel(
+    model = ContinualCrystalModel(
         node_dim=node_dim,
         hidden_dim=hidden_dim,
         n_properties=n_props,
         n_fidelities=n_fids,
-        n_layers=3,
+        adapter_name=adapter_name,
         adapter_rank=adapter_rank,
+        n_layers=n_layers,
         num_nearest_neighbors=num_nearest_neighbors,
-        freeze_encoder_weights=True,
+        update_coors=update_coors,
     ).to(device)
 
     freeze_steps = _last_occurrences(tasks)
 
-    # Normalization stats per task.
     task_stats: list[tuple[torch.Tensor, torch.Tensor, float]] = []
     nmaes: list[list[float]] = []
-    anchor: dict = {}
 
     for t, (dataset_tag, prop_name, fid_name) in enumerate(tasks):
         prop_id = prop2id[prop_name]
@@ -236,7 +209,6 @@ def continual_experiment(
         recs = task_records[t]
         train_dataset = JARVISCrystalDataset(recs, split="train")
         val_dataset = JARVISCrystalDataset(recs, split="val")
-        # Use per-task normalization stats from the training set.
         train_mean = torch.tensor(train_dataset.target_mean)
         train_std = torch.tensor(train_dataset.target_std)
         for ds in (train_dataset, val_dataset):
@@ -258,24 +230,25 @@ def continual_experiment(
         )
 
         best_nmae, mean, std, mad = train_task(
-            model, train_loader, val_loader, prop_id, fid_id, anchor, device,
-            epochs=epochs, lr=lr, mu=mu,
-            log_gradients=log_gradients and (t == 1),
+            model, train_loader, val_loader, prop_id, fid_id, device,
+            epochs=epochs, lr=lr, weight_decay=weight_decay, patience=5,
         )
         task_stats.append((mean, std, mad))
         print(f"  Best val nMAE on current task: {best_nmae:.3f}")
 
-        # Freeze only after the last occurrence of this (property, fidelity).
         if t in freeze_steps:
             model.freeze_task(prop_id, fid_id)
-        anchor = model.anchor_state()
+            print(
+                f"  Frozen task (prop={prop_name}, fid={fid_name}); "
+                f"incremental params for next task will be fresh."
+            )
 
         # Evaluate on test sets of all tasks seen so far.
         task_nmaes = []
         for prev_t in range(t + 1):
             prev_dataset_tag, prev_prop, prev_fid = tasks[prev_t]
             pid = prop2id[prev_prop]
-            fid = fid2id[prev_fid]
+            pfid = fid2id[prev_fid]
             mean_p, std_p, mad_p = task_stats[prev_t]
             prev_test_recs = task_records[prev_t]
             prev_dataset = JARVISCrystalDataset(prev_test_recs, split="test")
@@ -289,29 +262,44 @@ def continual_experiment(
                 collate_fn=collate_crystals,
             )
             nmae = evaluate_loader(
-                model, prev_loader, pid, fid, mean_p, std_p, mad_p, device
+                model, prev_loader, pid, pfid, mean_p, std_p, mad_p, device
             )
             task_nmaes.append(nmae)
         nmaes.append(task_nmaes)
         print(f"  test nMAEs after task {t + 1}: {[f'{x:.3f}' for x in task_nmaes]}")
 
-    return nmaes, {"model": model, "adapter_params": model.count_adapter_parameters()}
+    info = {
+        "model": model,
+        "adapter_params": sum(
+            model.count_task_parameters(p, f) for p, f in model._task_order
+        ),
+        "parameter_groups": model.get_parameter_group_counts(),
+    }
+    return nmaes, info
 
 
 def main():
+    from adapters import ADAPTER_REGISTRY
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--protocol", choices=["a", "b"], default="a")
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument(
+        "--adapter-name",
+        choices=list(ADAPTER_REGISTRY.keys()),
+        default="single_child_tucker",
+    )
     parser.add_argument("--adapter-rank", type=int, default=8)
+    parser.add_argument("--n-layers", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--mu", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--cap", type=int, default=None, help="Per-task sample cap for smoke tests")
     parser.add_argument("--num-nearest-neighbors", type=int, default=8)
-    parser.add_argument("--log-gradients", action="store_true", help="Log per-group gradient norms during A2 training")
+    parser.add_argument("--update-coors", action="store_true", help="Allow EGNN to update coordinates")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -334,13 +322,16 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        mu=args.mu,
+        weight_decay=args.weight_decay,
+        adapter_name=args.adapter_name,
         adapter_rank=args.adapter_rank,
+        n_layers=args.n_layers,
         num_nearest_neighbors=args.num_nearest_neighbors,
-        log_gradients=args.log_gradients,
+        update_coors=args.update_coors,
     )
 
     print("\n=== Final Results ===")
+    print(f"Parameter groups: {info['parameter_groups']}")
     print(f"Adapter + head parameters: {info['adapter_params']:,}")
     print(f"Average final nMAE: {sum(nmaes[-1]) / len(nmaes[-1]):.3f}")
     print(f"Average forgetting: {forgetting(nmaes):.3f}")

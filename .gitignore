@@ -40,5 +40,9 @@ artifacts/
 .DS_Store
 Thumbs.db
 
+# Local dependency copies (installed via pip -e or used as references)
+egnn-pytorch-main/
+matgl-main/
+
 # Artifact directory
 Continual Learning/
