@@ -17,9 +17,11 @@ by ``models.ContinualCrystalModel`` for backward compatibility.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
 import torch
-from pymatgen.core import Structure
+from pymatgen.core import Lattice, Structure
 
 try:
     from torch_geometric.data import Batch, Data
@@ -312,3 +314,69 @@ def collate_periodic_graphs(
         batched["pyg_batch"] = Batch.from_data_list(data_list)
 
     return batched
+
+
+def build_minimal_periodic_test_graph(
+    lattice_constant: float = 4.0,
+    elements: Sequence[str] | None = None,
+    frac_coords: np.ndarray | Sequence[Sequence[float]] | None = None,
+    edges: Sequence[tuple[int, int, tuple[int, int, int]]] | None = None,
+    node_feature_dim: int = 92,
+) -> dict[str, torch.Tensor]:
+    """Build a tiny explicit periodic-edge graph with caller-controlled shifts.
+
+    Unlike ``build_periodic_edge_graph``, this helper does not run a neighbor
+    search.  It is intended for unit tests that need a deterministic graph with
+    specific lattice shifts.
+
+    Args:
+        lattice_constant: Cubic lattice constant :math:`a`.
+        elements: List of element symbols, one per node.  Defaults to a single
+            silicon atom.
+        frac_coords: Fractional coordinates of the unit-cell atoms, shape
+            ``(N, 3)``.  Defaults to a single atom at the origin.
+        edges: List of ``(src, dst, shift)`` tuples.  ``shift`` is the integer
+            lattice shift :math:`n_{ij}`.  Defaults to no edges.
+        node_feature_dim: Dimensionality of one-hot element node features.
+
+    Returns:
+        Dictionary with the same keys as ``build_periodic_edge_graph``.
+    """
+    if elements is None:
+        elements = ["Si"]
+    if frac_coords is None:
+        frac_coords = [[0.0, 0.0, 0.0]]
+    if edges is None:
+        edges = []
+
+    frac_coords = np.asarray(frac_coords, dtype=np.float64)
+    lattice = Lattice.cubic(lattice_constant)
+    structure = Structure(lattice, elements, frac_coords)
+
+    node_feats = torch.stack(
+        [_element_one_hot(str(site.specie), node_feature_dim) for site in structure]
+    )
+    coords = torch.tensor(structure.cart_coords, dtype=torch.float32)
+    lattice_t = torch.tensor(structure.lattice.matrix, dtype=torch.float32)
+
+    if edges:
+        edge_index = torch.tensor(
+            [[src, dst] for src, dst, _ in edges], dtype=torch.long
+        ).T
+        edge_shifts = torch.tensor([shift for _, _, shift in edges], dtype=torch.long)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_shifts = torch.empty((0, 3), dtype=torch.long)
+
+    edge_vectors = _compute_edge_vectors(coords, edge_index, edge_shifts, lattice_t)
+
+    return {
+        "node_feats": node_feats,
+        "coords": coords,
+        "edge_index": edge_index,
+        "edge_shifts": edge_shifts,
+        "edge_vectors": edge_vectors,
+        "lattice": lattice_t,
+        "batch": torch.zeros(len(structure), dtype=torch.long),
+        "n_original": len(structure),
+    }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -465,3 +467,134 @@ def test_dataset_explicit_edges_flag():
     assert "edge_index" in graph
     assert "edge_shifts" in graph
     assert target.item() == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Dense EGNN periodic-shift consumption tests (反馈_2.md section 3)
+# ---------------------------------------------------------------------------
+
+
+def test_dense_egnn_does_not_see_lattice_shift():
+    """Dense EGNN path drops periodic lattice shifts and recomputes distances from coords.
+
+    The explicit periodic graph stores the correct relative displacement in
+    ``edge_vectors``.  Converting to dense tensors via
+    ``periodic_graph.to_dense_tensors`` intentionally drops those shifts and
+    keeps only the unit-cell coordinates, so the dense EGNN recomputes kNN
+    distances from the unit-cell point cloud and therefore uses the wrong
+    inter-atomic distance for periodic images.
+    """
+    pytest.importorskip("egnn_pytorch")
+    from egnn_pytorch import EGNN
+
+    from periodic_graph import build_minimal_periodic_test_graph, to_dense_tensors
+
+    lattice_constant = 4.0
+    # Two atoms near a cell boundary.  The correct periodic edge with shift
+    # n=(-1,0,0) wraps atom 1 back to a distance of 0.4 from atom 0, but the
+    # dense EGNN only sees the unwrapped unit-cell distance of 3.6.
+    graph = build_minimal_periodic_test_graph(
+        lattice_constant=lattice_constant,
+        elements=["Si", "Si"],
+        frac_coords=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+        edges=[(0, 1, (-1, 0, 0))],
+    )
+
+    # The sparse graph encodes the wrapped displacement of length 0.4.
+    assert graph["edge_vectors"].shape[0] == 1
+    wrapped_length = graph["edge_vectors"].norm(dim=1).item()
+    assert wrapped_length == pytest.approx(0.4, abs=1e-4)
+
+    # Dense conversion drops shifts and only stores the two unit-cell atoms.
+    with pytest.warns(UserWarning, match="drops periodic lattice shifts"):
+        node_feats, coords, mask, original_mask = to_dense_tensors(graph)
+    assert node_feats.shape == (2, 92)
+    assert coords.shape == (2, 3)
+    assert mask.sum() == 2
+
+    # The default EGNN init scale makes the message-passing contribution too
+    # small to detect at the output level for a single layer.  Raising init_eps
+    # keeps the architecture identical while making the distance-dependent
+    # message difference observable.
+    egnn = EGNN(
+        dim=92,
+        m_dim=32,
+        num_nearest_neighbors=2,
+        update_coors=False,
+        update_feats=True,
+        init_eps=2e-2,
+    )
+
+    # Dense EGNN forward on the unit-cell-only representation.  Atom 0's only
+    # neighbour is atom 1 at the unwrapped distance of 3.6.
+    torch.manual_seed(0)
+    out_dense, _ = egnn(
+        node_feats.unsqueeze(0), coords.unsqueeze(0), mask=mask.unsqueeze(0)
+    )
+
+    # Periodic-aware reference: include the actual periodic image used by the
+    # lattice shift.  Atom 0 now has a neighbour at the wrapped distance of 0.4.
+    image_coord = coords[1:2] + torch.tensor([[-lattice_constant, 0.0, 0.0]])
+    periodic_coords = torch.cat([coords, image_coord], dim=0)
+    periodic_feats = torch.cat([node_feats, node_feats[1:2]], dim=0)
+    periodic_mask = torch.tensor([True, True, True])
+
+    torch.manual_seed(0)
+    out_periodic, _ = egnn(
+        periodic_feats.unsqueeze(0),
+        periodic_coords.unsqueeze(0),
+        mask=periodic_mask.unsqueeze(0),
+    )
+
+    # The feature of atom 0 differs once the correct periodic image is present,
+    # proving the dense EGNN did not consume the lattice shift encoded in the
+    # sparse graph and instead used the unwrapped unit-cell distance.
+    assert not torch.allclose(out_dense[0, 0], out_periodic[0, 0], atol=1e-4)
+
+
+def test_sparse_backbone_consumes_lattice_shift():
+    """Sparse backbones consume lattice shifts and produce different features."""
+    from periodic_graph import build_minimal_periodic_test_graph
+
+    # Two atoms near a cell boundary.  The direct edge (n=(0,0,0)) has length
+    # 3.6, while wrapping around the cell with n=(-1,0,0) gives length 0.4.
+    lattice_constant = 4.0
+    frac_coords = [[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]]
+    graph_direct = build_minimal_periodic_test_graph(
+        lattice_constant=lattice_constant,
+        elements=["Si", "Si"],
+        frac_coords=frac_coords,
+        edges=[(0, 1, (0, 0, 0))],
+    )
+    graph_shifted = build_minimal_periodic_test_graph(
+        lattice_constant=lattice_constant,
+        elements=["Si", "Si"],
+        frac_coords=frac_coords,
+        edges=[(0, 1, (-1, 0, 0))],
+    )
+
+    direct_length = graph_direct["edge_vectors"].norm(dim=1).item()
+    shifted_length = graph_shifted["edge_vectors"].norm(dim=1).item()
+    assert direct_length == pytest.approx(3.6, abs=1e-4)
+    assert shifted_length == pytest.approx(0.4, abs=1e-4)
+
+    # Try MatGL first, then ALIGNN, then skip if neither is installed.
+    backbone = None
+    try:
+        from backbones import build_matgl_backbone
+
+        backbone = build_matgl_backbone(hidden_dim=16)
+    except Exception:
+        try:
+            from backbones import build_alignn_backbone
+
+            backbone = build_alignn_backbone(hidden_dim=16)
+        except Exception:
+            pytest.skip("Neither MatGL nor ALIGNN backbone is available")
+
+    assert backbone is not None
+    h_direct = backbone(graph_direct)
+    h_shifted = backbone(graph_shifted)
+
+    # The backbone consumed the different lattice shifts, so node features differ.
+    assert not torch.allclose(h_direct, h_shifted, atol=1e-4)
