@@ -1,0 +1,43 @@
+# PhyTCA Protocol A: JARVIS database evolution.
+protocol: a
+description: |
+  Continual learning across database versions and properties:
+    1. JARVIS-2021 formation energy (OptB88vdW)
+    2. JARVIS-2022 formation energy (OptB88vdW)
+    3. JARVIS-2021 band gap (OptB88vdW)
+    4. JARVIS-2022 band gap (OptB88vdW)
+
+data:
+  datasets:
+    - dft_3d_2021
+    - dft_3d
+  target_fields:
+    formation_energy: formation_energy_peratom
+    band_gap: optb88vdw_bandgap
+  formula_disjoint_seed: 42
+
+model:
+  node_dim: 92
+  hidden_dim: 64
+  n_layers: 3
+  adapter_rank: 8
+  num_nearest_neighbors: 16
+  freeze_encoder_weights: true
+
+graph:
+  supercell_matrix: 2
+  max_neighbors: 16
+
+training:
+  epochs: 20
+  batch_size: 32
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  mu: 1.0e-2
+  patience: 5
+  train_frac: 0.8
+
+audit:
+  min_samples_per_task: 1000
+  min_valid_target_rate: 0.80
+  report_dir: reports

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual environments
+venv/
+.env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data and datasets
+data/
+data_cache/
+cifar100_data/
+*.zip
+*.tar.gz
+*.json.zip
+
+# Model outputs and logs
+logs/
+reports/
+artifacts/
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# Figures
+*.png
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifact directory
+Continual Learning/
