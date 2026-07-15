@@ -27,6 +27,7 @@ cifar100_data/
 logs/
 reports/
 artifacts/
+runs/
 *.pkl
 *.pt
 *.pth

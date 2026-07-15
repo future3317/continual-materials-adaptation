@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "continual-materials-adaptation"
+version = "0.2.0"
+description = "Exact-retention continual multi-fidelity adaptation for materials property prediction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "FR-PhyTCA authors"},
+]
+keywords = ["continual learning", "multi-fidelity", "materials science", "graph neural networks"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "pytest>=7.0",
+    "pymatgen>=2023.0",
+    "jarvis-tools>=2023.0",
+    "torch-geometric>=2.3",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "pyarrow>=12.0",
+]
+
+[project.optional-dependencies]
+backbone = [
+    "egnn-pytorch>=0.3",
+    "matgl>=1.0",
+    "alignn>=2026.5.20",
+]
+dgl = [
+    "dgl",
+]
+dev = [
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/future3317/continual-materials-adaptation"
+Repository = "https://github.com/future3317/continual-materials-adaptation"
+
+[tool.setuptools]
+py-modules = [
+    "adapters",
+    "backbones",
+    "baselines",
+    "data",
+    "data_audit",
+    "diagnostics",
+    "fidelity_graph",
+    "models",
+    "periodic_graph",
+    "phytca",
+    "train_phytca",
+]
