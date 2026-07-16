@@ -220,8 +220,11 @@ class ContinualCrystalModel(nn.Module):
             n_properties=self.n_properties,
             n_fidelities=self.n_fidelities,
         )
-        self.adapter_banks[key] = bank
-        self.heads[key] = nn.Linear(self.hidden_dim, 1)
+        ref = self.encoder.node_embed.weight
+        self.adapter_banks[key] = bank.to(device=ref.device, dtype=ref.dtype)
+        self.heads[key] = nn.Linear(self.hidden_dim, 1).to(
+            device=ref.device, dtype=ref.dtype
+        )
         self._task_order.append((int(prop_id), int(fid_id)))
         return key
 
@@ -434,7 +437,10 @@ class CopyOnWriteFullChildModel(nn.Module):
             p.requires_grad = True
 
         self.child_encoders[key] = child
-        self.heads[key] = nn.Linear(self.hidden_dim, 1)
+        ref = self.template.node_embed.weight
+        self.heads[key] = nn.Linear(self.hidden_dim, 1).to(
+            device=ref.device, dtype=ref.dtype
+        )
         self._route_order.append(key)
         return key
 

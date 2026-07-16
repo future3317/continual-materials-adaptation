@@ -57,7 +57,14 @@ class SharedBasisAdapterBank(nn.Module):
         """Allocate a new private middle matrix for ``key``."""
         if key in self.route_m:
             return
-        self.route_m[key] = nn.Parameter(torch.empty(self.rank, self.rank))
+        self.route_m[key] = nn.Parameter(
+            torch.empty(
+                self.rank,
+                self.rank,
+                device=self.u_in.device,
+                dtype=self.u_in.dtype,
+            )
+        )
         nn.init.orthogonal_(self.route_m[key])
 
     def freeze_route(self, key: str) -> None:
@@ -135,7 +142,10 @@ class VersionedFidelityGraph(nn.Module):
             return key
         for bank in self.adapter_banks:
             bank.add_route(key)
-        self.heads[key] = nn.Linear(self.hidden_dim, 1)
+        ref = self.encoder.node_embed.weight
+        self.heads[key] = nn.Linear(self.hidden_dim, 1).to(
+            device=ref.device, dtype=ref.dtype
+        )
         self._route_order.append(key)
         return key
 
