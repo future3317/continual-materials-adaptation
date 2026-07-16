@@ -56,6 +56,10 @@ Frozen crystal-graph encoder with per-task adapter banks and heads. Exact retent
 
 Frozen encoder plus shared low-rank bases `U_in`, `U_out`. Each versioned endpoint owns a private middle matrix `M_r` and a head. `publish_route(...)` freezes the route's coefficients and the shared bases, guaranteeing exact retention. New routes add new `M_r` matrices on top of the frozen bases. Incremental parameter count per endpoint: $L r^2 + (d+1)$.
 
+### `models.CopyOnWriteFullChildModel`
+
+Each versioned endpoint owns a deep copy of the full crystal encoder and a private head. This is the strongest exact-retention baseline (no cross-route interference) but pays a full encoder per endpoint. New children are initialized by copying the most recently trained child and then unfreezing the copy.
+
 ## Testing
 
 Run core tests with:
@@ -79,6 +83,12 @@ Versioned-endpoint training:
 
 ```bash
 python scripts/run_versioned_protocol.py --snapshots dft_3d_2021 dft_3d --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --epochs 15 --device cuda
+```
+
+Versioned baseline comparison:
+
+```bash
+python scripts/run_versioned_baselines.py --snapshots dft_3d_2021 dft_3d --properties band_gap --fidelities OptB88vdW TB-mBJ --methods versioned_graph copy_on_write continual_tucker continual_lora_aba joint independent --epochs 15 --device cuda
 ```
 
 For smoke tests, add `--cap 50` to limit per-split records.
@@ -114,11 +124,12 @@ Metrics must include: latest-task MAE, per-endpoint drift, forward/backward tran
    - Implemented `versioned_graph.VersionedFidelityGraph` with exact retention by structural isolation.
    - Added formal impossibility statement and unit tests.
    - Implemented `scripts/run_versioned_protocol.py`, the first end-to-end three-axis benchmark runner.
+   - Added `models.CopyOnWriteFullChildModel` and `scripts/run_versioned_baselines.py` for versioned-protocol baseline comparison.
    - Verified `data_audit.py --protocol a/b` still pass and selected unit tests pass.
 
 2. **Remaining work**
    - Implement the Pareto evaluation harness (calibration, latency, checkpoint size, top-k recall, forward transfer).
-   - Compare against proper baselines on the versioned protocol (independent, joint, copy-on-write, LoRA-AB/ABA, replay).
+   - Add replay / distillation baselines for same-fidelity revision.
    - Rewrite the paper around backward-compatible model serving, the impossibility theorem, and the three-axis benchmark.
 
 ## Avoid

@@ -369,6 +369,127 @@ class ContinualCrystalModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Copy-on-write full child baseline
+# ---------------------------------------------------------------------------
+
+
+class CopyOnWriteFullChildModel(nn.Module):
+    """Each versioned endpoint owns a deep copy of the full encoder + a head.
+
+    This is the strongest exact-retention baseline: every route has an
+    independent network, so there is no cross-route interference at all.  The
+    cost is a parameter count that grows linearly with the number of routes.
+    New children are initialized by copying the most recently trained child,
+    giving a warm-start while keeping older children frozen.
+    """
+
+    def __init__(
+        self,
+        node_dim: int,
+        hidden_dim: int,
+        n_layers: int = 3,
+        num_nearest_neighbors: int = 8,
+        update_coors: bool = False,
+    ) -> None:
+        super().__init__()
+        self.node_dim = node_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.num_nearest_neighbors = num_nearest_neighbors
+
+        # The template encoder is also the first child's encoder.
+        self.template = CrystalEncoder(
+            node_dim=node_dim,
+            hidden_dim=hidden_dim,
+            n_layers=n_layers,
+            num_nearest_neighbors=num_nearest_neighbors,
+            update_coors=update_coors,
+        )
+        self.child_encoders: Dict[str, CrystalEncoder] = nn.ModuleDict()
+        self.heads: Dict[str, nn.Linear] = nn.ModuleDict()
+        self._route_order: List[str] = []
+        self._frozen_routes: set[str] = set()
+
+    def _route_key(self, version: str, prop_id: int, fid_id: int) -> str:
+        return f"v{version}_p{int(prop_id)}_f{int(fid_id)}"
+
+    def add_route(self, version: str, prop_id: int, fid_id: int) -> str:
+        """Allocate a new full child encoder and head.
+
+        The first route uses the template encoder; later routes copy the most
+        recent child before it was frozen, then unfreeze the copy for training.
+        """
+        key = self._route_key(version, prop_id, fid_id)
+        if key in self.heads:
+            return key
+
+        if not self._route_order:
+            child = self.template
+        else:
+            latest_key = self._route_order[-1]
+            child = copy.deepcopy(self.child_encoders[latest_key])
+
+        # Ensure the new child is trainable even if copied from a frozen parent.
+        for p in child.parameters():
+            p.requires_grad = True
+
+        self.child_encoders[key] = child
+        self.heads[key] = nn.Linear(self.hidden_dim, 1)
+        self._route_order.append(key)
+        return key
+
+    def freeze_route(self, version: str, prop_id: int, fid_id: int) -> None:
+        """Freeze a published endpoint."""
+        key = self._route_key(version, prop_id, fid_id)
+        self._frozen_routes.add(key)
+        if key in self.child_encoders:
+            for p in self.child_encoders[key].parameters():
+                p.requires_grad = False
+        if key in self.heads:
+            for p in self.heads[key].parameters():
+                p.requires_grad = False
+
+    def is_frozen(self, version: str, prop_id: int, fid_id: int) -> bool:
+        return self._route_key(version, prop_id, fid_id) in self._frozen_routes
+
+    def current_trainable_parameters(self) -> List[nn.Parameter]:
+        return [p for p in self.parameters() if p.requires_grad]
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
+        original_mask: torch.Tensor,
+        version: str,
+        prop_id: int,
+        fid_id: int,
+    ) -> torch.Tensor:
+        """Predict for the requested endpoint using its private encoder."""
+        key = self._route_key(version, prop_id, fid_id)
+        if key not in self.heads:
+            raise KeyError(f"Route {key} not allocated")
+
+        child = self.child_encoders[key]
+        h, _ = child(node_feats, coords, mask)
+        if original_mask is None:
+            pooled = h.mean(dim=1)
+        else:
+            mask_exp = original_mask.unsqueeze(-1).float()
+            pooled = (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1).clamp_min(1.0))
+        return self.heads[key](pooled).squeeze(-1)
+
+    def incremental_parameters(self, version: str, prop_id: int, fid_id: int) -> int:
+        key = self._route_key(version, prop_id, fid_id)
+        total = sum(p.numel() for p in self.child_encoders[key].parameters())
+        total += sum(p.numel() for p in self.heads[key].parameters())
+        return total
+
+    def total_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+# ---------------------------------------------------------------------------
 # Prediction-residual helpers (addresses 反馈_2.md 2.1)
 # ---------------------------------------------------------------------------
 
