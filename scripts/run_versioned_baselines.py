@@ -108,7 +108,7 @@ def _run_versioned_graph(
         train_loader, val_loader, _, mean, std, mad = _make_loaders(
             task_records[t], args.batch_size
         )
-        _, mean, std, mad = _train_one_task_trainable(
+        _, mean, std, mad, _ = _train_one_task_trainable(
             model,
             train_loader,
             val_loader,
@@ -165,7 +165,7 @@ def _run_copy_on_write(
         train_loader, val_loader, _, mean, std, mad = _make_loaders(
             task_records[t], args.batch_size
         )
-        _, mean, std, mad = _train_one_task_trainable(
+        _, mean, std, mad, _ = _train_one_task_trainable(
             model,
             train_loader,
             val_loader,
@@ -230,7 +230,7 @@ def _run_continual_model(
         train_loader, val_loader, _, mean, std, mad = _make_loaders(
             task_records[t], args.batch_size
         )
-        _, mean, std, mad = _train_one_task_trainable(
+        _, mean, std, mad, _ = _train_one_task_trainable(
             model,
             train_loader,
             val_loader,

@@ -42,6 +42,36 @@ def test_versioned_runner_smoke(tmp_path, rank: int) -> None:
     assert (tmp_path / "metrics.json").exists()
 
 
+def test_versioned_runner_pareto_metrics(tmp_path) -> None:
+    """The runner appends Pareto metrics when --pareto is set."""
+    device = torch.device("cpu")
+    metrics = run_versioned_protocol(
+        snapshots=["dft_3d_2021"],
+        properties=["band_gap"],
+        fidelities=["OptB88vdW", "TB-mBJ"],
+        hidden_dim=16,
+        rank=4,
+        n_layers=2,
+        num_nearest_neighbors=4,
+        epochs=1,
+        batch_size=4,
+        lr=1e-3,
+        weight_decay=1e-4,
+        patience=1,
+        device=device,
+        seed=42,
+        cap=8,
+        output_dir=tmp_path,
+        pareto=True,
+    )
+    assert "pareto" in metrics
+    pareto = metrics["pareto"]
+    assert "calibration_ece" in pareto
+    assert "latency_ms_mean" in pareto
+    assert "estimated_flops" in pareto
+    assert "checkpoint_total_bytes" in pareto
+
+
 def test_versioned_runner_no_forgetting_on_published_routes(tmp_path) -> None:
     """Training the second route does not change predictions of the first."""
     device = torch.device("cpu")

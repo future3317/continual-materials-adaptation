@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from data import build_versioned_protocol
+from pareto_harness import evaluate_pareto_metrics
 from train_utils import (
     _evaluate_all_seen_versioned,
     _make_loaders,
@@ -63,6 +64,7 @@ def run_versioned_protocol(
     seed: int,
     cap: int | None,
     output_dir: Path,
+    pareto: bool = False,
 ) -> dict[str, Any]:
     """Run the versioned benchmark and return metrics."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +113,7 @@ def run_versioned_protocol(
         )
 
         train_start = time.perf_counter()
-        best_val_nmae, mean, std, mad = _train_one_task_trainable(
+        best_val_nmae, mean, std, mad, optimizer = _train_one_task_trainable(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -169,6 +171,22 @@ def run_versioned_protocol(
         "audit": audit,
     }
 
+    if pareto:
+        latest_version, latest_prop, latest_fid, _ = tasks[-1]
+        latest_pid = prop2id[latest_prop]
+        latest_fid_id = fid2id[latest_fid]
+        _, _, latest_test_loader, latest_mean, latest_std, latest_mad = _make_loaders(
+            task_records[-1], batch_size
+        )
+        pareto_metrics = evaluate_pareto_metrics(
+            model=model,
+            loader=latest_test_loader,
+            optimizer=optimizer,
+            device=device,
+            forward_args=(latest_version, latest_pid, latest_fid_id),
+        )
+        metrics["pareto"] = pareto_metrics
+
     metrics_path = output_dir / "metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
@@ -219,6 +237,11 @@ def main() -> None:
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument(
+        "--pareto",
+        action="store_true",
+        help="Compute calibration, latency, FLOP, and checkpoint-size metrics for the final route",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("reports/versioned_protocol"),
@@ -245,6 +268,7 @@ def main() -> None:
         seed=args.seed,
         cap=args.cap,
         output_dir=args.output_dir,
+        pareto=args.pareto,
     )
 
 

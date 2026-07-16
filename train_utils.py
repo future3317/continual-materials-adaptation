@@ -167,7 +167,7 @@ def _train_one_task(
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-    return best_nmae, target_mean, target_std, mad
+    return best_nmae, target_mean, target_std, mad, optimizer
 
 
 def _evaluate_all_seen(
@@ -209,12 +209,15 @@ def _train_one_task_trainable(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     patience: int = 5,
-) -> tuple[float, torch.Tensor, torch.Tensor, float]:
+) -> tuple[float, torch.Tensor, torch.Tensor, float, torch.optim.Optimizer]:
     """Generic single-task training using only currently trainable parameters.
 
     ``forward_extra_args`` is passed to ``model.forward`` after the standard
     5-tuple and before targets; e.g. ``(prop_id, fid_id)`` or
     ``(version_id, prop_id, fid_id)``.
+
+    Returns best validation nMAE, target mean, target std, MAD, and the
+    optimizer (so callers can inspect optimizer state bytes if desired).
     """
     trainable = (
         model.current_trainable_parameters()
@@ -273,7 +276,7 @@ def _train_one_task_trainable(
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-    return best_nmae, target_mean, target_std, mad
+    return best_nmae, target_mean, target_std, mad, optimizer
 
 
 def _evaluate_loader(
