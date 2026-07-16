@@ -31,6 +31,26 @@ from periodic_graph import build_periodic_edge_graph
 
 
 # ---------------------------------------------------------------------------
+# Supported target fields
+# ---------------------------------------------------------------------------
+
+# Maps (property, fidelity) pairs to the JARVIS record field that stores the
+# corresponding scalar target. Not all combinations are available in every
+# snapshot; callers should filter records to those with finite targets.
+TARGET_FIELDS: dict[tuple[str, str], str] = {
+    ("formation_energy", "OptB88vdW"): "formation_energy_peratom",
+    ("band_gap", "OptB88vdW"): "optb88vdw_bandgap",
+    ("band_gap", "TB-mBJ"): "mbj_bandgap",
+    ("band_gap", "HSE"): "hse_gap",
+    ("bulk_modulus", "OptB88vdW"): "bulk_modulus_kv",
+    ("shear_modulus", "OptB88vdW"): "shear_modulus_gv",
+    ("dielectric_x", "OptB88vdW"): "epsx",
+    ("dielectric_y", "OptB88vdW"): "epsy",
+    ("dielectric_z", "OptB88vdW"): "epsz",
+}
+
+
+# ---------------------------------------------------------------------------
 # JARVIS cache helpers
 # ---------------------------------------------------------------------------
 
@@ -636,6 +656,130 @@ def build_protocol_b(
     assert not (groups_by_split["train"] & groups_by_split["val"])
     assert not (groups_by_split["train"] & groups_by_split["test"])
     assert not (groups_by_split["val"] & groups_by_split["test"])
+
+    return tasks, task_records, audit
+
+
+def _select_and_tag_versioned(
+    records: list[dict],
+    dataset_tag: str,
+    property_name: str,
+    fidelity_name: str,
+) -> list[dict]:
+    """Filter records with a valid target and attach versioned metadata."""
+    target_field = TARGET_FIELDS.get((property_name, fidelity_name))
+    if target_field is None:
+        return []
+    out: list[dict] = []
+    for r in records:
+        val = parse_target(r.get(target_field))
+        if val is None:
+            continue
+        struct = jarvis_record_to_structure(r)
+        out.append(
+            {
+                "jid": r.get("jid"),
+                "structure": struct,
+                "formula": struct.composition.reduced_formula,
+                "dataset": dataset_tag,
+                "version": dataset_tag,
+                "property": property_name,
+                "fidelity": fidelity_name,
+                "target": val,
+            }
+        )
+    return out
+
+
+def build_versioned_protocol(
+    snapshots: Sequence[str] = ("dft_3d_2021", "dft_3d"),
+    properties: Sequence[str] = ("band_gap",),
+    fidelities: Sequence[str] = ("OptB88vdW", "TB-mBJ"),
+    cache_dir: str | None = None,
+    seed: int = 42,
+    global_split: bool = True,
+) -> tuple[list[tuple[str, str, str, str]], list[list[dict]], dict]:
+    """Build a versioned (snapshot, property, fidelity) protocol.
+
+    Each task corresponds to one ``(version, property, fidelity)`` route.  The
+    same ``(property, fidelity)`` appearing in two snapshots produces two
+    distinct tasks, allowing the benchmark to model database-version updates
+    where the target value for the same material may change.
+
+    Args:
+        snapshots: JARVIS dataset names ordered by release time.
+        properties: Property names (must have entries in ``TARGET_FIELDS``).
+        fidelities: Fidelity names (must have entries in ``TARGET_FIELDS``).
+        cache_dir: JARVIS cache directory.
+        seed: Random seed for splitting.
+        global_split: If True, assign a single canonical material-group split
+            across all task views, so the same material is always in the same
+            train/val/test partition regardless of version or fidelity.
+
+    Returns:
+        tasks: List of ``(version, property, fidelity, target_field)`` descriptors.
+        task_records: List of record lists, one per task.
+        audit: Dict with counts per task and revision statistics.
+    """
+    loaded = {name: load_jarvis_dataset(name, cache_dir) for name in snapshots}
+
+    tasks: list[tuple[str, str, str, str]] = []
+    task_records: list[list[dict]] = []
+    all_records: list[dict] = []
+
+    for snap in snapshots:
+        for prop in properties:
+            for fid in fidelities:
+                recs = _select_and_tag_versioned(
+                    loaded[snap], snap, prop, fid
+                )
+                if not recs:
+                    continue
+                target_field = TARGET_FIELDS[(prop, fid)]
+                tasks.append((snap, prop, fid, target_field))
+                task_records.append(recs)
+                all_records.extend(recs)
+
+    if global_split:
+        assign_global_splits(all_records, seed=seed)
+
+    audit: dict[str, Any] = {
+        "snapshots": list(snapshots),
+        "properties": list(properties),
+        "fidelities": list(fidelities),
+        "n_tasks": len(tasks),
+    }
+    for (snap, prop, fid, field), recs in zip(tasks, task_records):
+        audit[f"{snap}_{prop}_{fid}"] = {
+            "n_records": len(recs),
+            "train": sum(1 for r in recs if r.get("split") == "train"),
+            "val": sum(1 for r in recs if r.get("split") == "val"),
+            "test": sum(1 for r in recs if r.get("split") == "test"),
+        }
+
+    # Revision audit: count materials whose target changed between consecutive
+    # snapshots for the same (property, fidelity).
+    for prop in properties:
+        for fid in fidelities:
+            target_field = TARGET_FIELDS.get((prop, fid))
+            if target_field is None:
+                continue
+            for s_prev, s_next in zip(snapshots[:-1], snapshots[1:]):
+                prev = {r["jid"]: r for r in loaded[s_prev]}
+                changed = 0
+                retained = 0
+                for r in loaded[s_next]:
+                    jid = r["jid"]
+                    if jid in prev:
+                        retained += 1
+                        v_prev = parse_target(prev[jid].get(target_field))
+                        v_next = parse_target(r.get(target_field))
+                        if v_prev is not None and v_next is not None and abs(v_prev - v_next) > 1e-6:
+                            changed += 1
+                audit[f"revisions_{prop}_{fid}_{s_prev}_to_{s_next}"] = {
+                    "retained": retained,
+                    "target_changed": changed,
+                }
 
     return tasks, task_records, audit
 

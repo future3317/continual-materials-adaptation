@@ -32,9 +32,10 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from baselines import LoRALinear
+from legacy.baselines import LoRALinear
 from data import JARVISCrystalDataset, build_protocol_b, cap_splits, collate_crystals
-from phytca import PhyTCAModel, backward_transfer, compute_mad, forgetting, normalized_mae
+from legacy.phytca import PhyTCAModel
+from train_utils import backward_transfer, compute_mad, forgetting, normalized_mae
 
 
 # ---------------------------------------------------------------------------

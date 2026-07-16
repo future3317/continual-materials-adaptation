@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from phytca import backward_transfer, forgetting
+from train_utils import backward_transfer, forgetting
 
 
 def test_forgetting_two_task():

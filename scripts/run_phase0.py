@@ -20,9 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from baselines import BASELINE_REGISTRY
+from legacy.baselines import BASELINE_REGISTRY
 from data import build_protocol_a, build_protocol_b
-from phytca import backward_transfer, forgetting
+from train_utils import backward_transfer, forgetting
 from train_phytca import continual_experiment
 
 

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from data import JARVISCrystalDataset, build_protocol_a, build_protocol_b, collate_crystals
-from phytca import PhyTCAModel
+from legacy.phytca import PhyTCAModel
 from train_phytca import _last_occurrences, _name_to_id, continual_experiment
 
 

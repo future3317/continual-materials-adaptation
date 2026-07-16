@@ -37,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from adapters import ADAPTER_REGISTRY
-from baselines import _make_loaders
+from train_utils import _make_loaders
 from data import (
     JARVISCrystalDataset,
     assign_global_splits,

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from adapters import ADAPTER_REGISTRY
-from baselines import _evaluate_all_seen, _make_loaders, _train_one_task
+from train_utils import _evaluate_all_seen, _make_loaders, _train_one_task
 from data import JARVISCrystalDataset, collate_crystals
 from models import (
     ContinualCrystalModel,

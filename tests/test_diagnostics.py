@@ -249,7 +249,7 @@ def test_frozen_opt_residual_model_routing():
 
 def test_replay_storage_accounting():
     """_detailed_parameter_stats correctly counts replay buffer storage."""
-    from phytca import PhyTCAModel
+    from legacy.phytca import PhyTCAModel
 
     model = PhyTCAModel(
         node_dim=5,

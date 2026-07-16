@@ -1,10 +1,20 @@
-# CLAUDE.md — FR-PhyTCA
+# CLAUDE.md — Backward-Compatible Model Serving for Evolving Materials Databases
 
 ## Project context
 
-This repository implements **FR-PhyTCA** (Fidelity-Residual Physics-Structured Tensor Component Adaptation), a continual-learning framework for evolving materials databases. The method first learns a **parent** model on a low-cost, abundant fidelity and then freezes its effective route permanently. Each subsequent higher fidelity is learned as a small, structured Tucker residual on top of the frozen parent, so the parent fidelity route is exactly invariant by construction and forgetting is identically zero.
+This repository studies **backward-compatible model serving** for evolving materials databases. The core observation is that exact retention of an old prediction endpoint and continual learning of new labels for the same `(material, property, fidelity)` are fundamentally incompatible when no version identifier is provided at inference: a single deterministic function cannot output two different values for the same input. The project therefore formalizes the problem as serving a set of **versioned endpoints**. Each endpoint is identified by `(version, property, fidelity)`. Old endpoints are frozen after publication; the latest endpoint is allowed to learn revised data and new fidelities.
 
-The symmetric **PhyTCA** baseline (shared Tucker factors updated for every task) is retained for comparison in `phytca.py` and `baselines.py`. The FR-PhyTCA redesign lives in `diagnostics.py` and is executed by `scripts/run_phase0_diagnostics.py`.
+The repository contains both (1) an initial task-incremental FR-PhyTCA implementation (`diagnostics.py`, `train_phytca.py`) and (2) a new `VersionedFidelityGraph` (`versioned_graph.py`) that implements structural exact retention for published endpoints via shared low-rank bases and route-private coefficients.
+
+The symmetric **PhyTCA** baseline and the old Phase-0 baselines have been moved to `legacy/`; they are retained only for reference and should not be used in new work.
+
+## Problem statement (formal)
+
+**Theorem (Impossibility of exact retention without version IDs).** Let $f$ be a deterministic predictor queried with a fixed input $x$ and a fixed task descriptor $(p,f)$ but no version identifier. Suppose the label for $(x,p,f)$ changes from $y_{\text{old}}$ to $y_{\text{new}} \neq y_{\text{old}}$ between two database snapshots. There is no single model $f$ that simultaneously (i) exactly retains the old prediction, $f(x,p,f)=y_{\text{old}}$, and (ii) learns the new label, $f(x,p,f)=y_{\text{new}}$.
+
+**Proof.** A function maps each input to exactly one output. The two requirements demand two distinct outputs for the same input, a contradiction. Therefore exact retention plus learning requires either a version identifier at inference or multiple endpoint functions.
+
+This motivates the versioned-endpoint design: inference must specify which published endpoint to query.
 
 ## Environment
 
@@ -15,118 +25,94 @@ The symmetric **PhyTCA** baseline (shared Tucker factors updated for every task)
 
 - Python 3.11+ with `from __future__ import annotations`.
 - Prefer explicit type hints.
-- Keep modules flat and focused: `data.py` for data, `phytca.py` for the symmetric baseline, `diagnostics.py` for FR-PhyTCA variants, `train_phytca.py` for training, `data_audit.py` for audits, `baselines.py` for comparison methods.
-- Avoid creating many small files; reuse existing modules.
+- Keep modules flat and focused: `data.py` for data, `models.py`/`versioned_graph.py` for the new architecture, `train_utils.py` for shared training utilities, `diagnostics.py` for experiments, `data_audit.py` for audits.
+- Legacy code lives in `legacy/` and should not be imported by new modules.
 - Default to no comments; only explain non-obvious invariants.
 
 ## Data workflow
 
 1. JARVIS data lives in `data_cache/jarvis/` as zip files.
 2. Use `data.load_jarvis_dataset(name)` which loads directly from zip and falls back to `jarvis-tools`.
-3. Run `python data_audit.py --protocol {a,b}` to produce manifests, reports, and the GO/NO-GO gate.
-4. Training uses `JARVISCrystalDataset` and `collate_crystals`, which return a 5-tuple: `(node_feats, coords, mask, original_mask, targets)`. The model must pool using `original_mask` only.
+3. Target fields are defined in `data.TARGET_FIELDS` and include band gap (OptB88vdW, TB-mBJ, HSE), formation energy, bulk modulus, shear modulus, and dielectric tensor components.
+4. Run `python data_audit.py --protocol {a,b}` to produce manifests, reports, and the GO/NO-GO gate for the legacy Protocol A/B benchmarks.
+5. Use `data.build_versioned_protocol(...)` to construct three-axis `(version, property, fidelity)` tasks with canonical material-group splits.
+6. Training uses `JARVISCrystalDataset` and `collate_crystals`, which return a 5-tuple: `(node_feats, coords, mask, original_mask, targets)`. The model must pool using `original_mask` only.
 
 ## Protocols
 
-- **Protocol A** — database evolution across JARVIS 2021/2022 for formation energy and band gap (OptB88vdW). A1↔A2 and A3↔A4 are data-incremental: they share property/fidelity embeddings, adapter route, and head. The route is frozen only after its final occurrence.
+- **Protocol A** — database evolution across JARVIS 2021/2022 for formation energy and band gap (OptB88vdW). A1↔A2 and A3↔A4 are data-incremental: they share property/fidelity embeddings, adapter route, and head. The route is frozen only after its final occurrence. *Limitation:* because the same `(property, fidelity)` route is reused across snapshots, exact retention cannot hold when a target value is revised.
 - **Protocol B** — multi-fidelity band gap: OptB88vdW → TB-mBJ across both JARVIS versions, with paired records sharing splits.
+- **Versioned Protocol** — the new three-axis benchmark built by `data.build_versioned_protocol`. Each `(version, property, fidelity)` combination is a distinct endpoint, so 2021 OPT and 2022 OPT are separate routes and exact retention of the 2021 endpoint is well defined.
 
-Protocol A snapshots are JID-disjoint; each task's train/val/test are formula-disjoint. Do not introduce Materials Project data or tensor properties unless explicitly requested.
+Do not introduce Materials Project data or tensor properties unless explicitly requested.
+
+## Architecture
+
+### `models.ContinualCrystalModel`
+
+Frozen crystal-graph encoder with per-task adapter banks and heads. Exact retention by structural isolation: old tasks are frozen via `requires_grad=False` and excluded from the child optimizer.
+
+### `versioned_graph.VersionedFidelityGraph`
+
+Frozen encoder plus shared low-rank bases `U_in`, `U_out`. Each versioned endpoint owns a private middle matrix `M_r` and a head. `publish_route(...)` freezes the route's coefficients and the shared bases, guaranteeing exact retention. New routes add new `M_r` matrices on top of the frozen bases. Incremental parameter count per endpoint: $L r^2 + (d+1)$.
 
 ## Testing
 
-Run PBC, protocol, and FR-PhyTCA tests with:
+Run core tests with:
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/test_versioned_graph.py tests/test_adapters_models.py tests/test_global_splits.py tests/test_fidelity_graph.py -v
 ```
 
-`tests/test_periodic_graph.py` covers multi-layer PBC invariance, halo convergence, and splitting correctness. `tests/test_protocol_semantics.py` covers data-incremental routing and freezing invariants. `tests/test_diagnostics.py` covers FR-PhyTCA parent-route invariance, canonical-to-progressive state remapping, residual identity initialization, and replay storage accounting.
+`tests/test_versioned_graph.py` covers:
+- exact retention of published endpoints under training of new routes,
+- the impossibility sanity check without version IDs,
+- incremental parameter accounting.
+
+`tests/test_global_splits.py` covers canonical material-group splits and cross-year leakage prevention.
 
 ## Training
+
+Legacy task-incremental training:
 
 ```bash
 python train_phytca.py --protocol a --hidden-dim 64 --adapter-rank 8 --epochs 20 --device cuda
 ```
 
-For quick smoke tests use `--cap 500 --epochs 2 --hidden-dim 32 --adapter-rank 4`. Add `--log-gradients` to print per-parameter-group gradient norms during the A2 training step.
+Versioned-endpoint training is currently exercised through `versioned_graph.py` and the unit tests. A full three-axis benchmark runner and Pareto evaluation harness are the next implementation steps.
 
 ## Baselines and Phase 0 comparison
 
-`baselines.py` implements joint, independent, sequential fine-tuning, frozen encoder + independent heads, EWC, replay, independent LoRA, shared LoRA bank, and symmetric PhyTCA.
+Old baselines (joint, independent, sequential, EWC, replay, LoRA variants, symmetric PhyTCA) have been moved to `legacy/baselines.py` and `legacy/phytca.py`. They are no longer part of the recommended workflow.
 
-Run the Protocol B two-task screening:
+The new evaluation will compare:
+- Independent models per endpoint (upper bound on accuracy, no sharing),
+- Joint model on all endpoints (upper bound, no exact retention),
+- `VersionedFidelityGraph` with published frozen routes,
+- Copy-on-write full child models,
+- Standard LoRA-AB and LoRA-ABA adapters,
+- Replay / distillation / functional regularization for the same-fidelity revision case.
 
-```bash
-python scripts/run_phase0_b_screening.py \
-  --train-cap 2000 --val-cap 500 --test-cap 1000 \
-  --seed 42 --epochs 10 --patience 3 --batch-size 32 \
-  --hidden-dim 64 --adapter-rank 8 --device cuda --with-joint
-```
+Metrics must include: latest-task MAE, per-endpoint drift, forward/backward transfer, calibration error, parameter count, checkpoint size, inference latency, and top-k recall.
 
-Run the paired recheck of PhyTCA `μ=0` vs `μ=0.01`:
+## Status and next steps
 
-```bash
-python scripts/run_phase0_b_screening.py --paired-recheck --device cuda
-```
+1. **Done in this refactor**
+   - Moved `phytca.py` and `baselines.py` to `legacy/`.
+   - Extracted shared training utilities into `train_utils.py`.
+   - Added `data.TARGET_FIELDS` and `data.build_versioned_protocol` for three-axis tasks.
+   - Implemented `versioned_graph.VersionedFidelityGraph` with exact retention by structural isolation.
+   - Added formal impossibility statement and unit tests.
+   - Verified `data_audit.py --protocol a/b` still pass and selected unit tests pass.
 
-Tune `μ` on `continual_dev` over `[0, 1e-5, 1e-4, 1e-3, 1e-2]`:
-
-```bash
-python scripts/run_phase0_b_screening.py --mu-grid --device cuda
-```
-
-Round 1 produced `NO_GO_PHYTCA_NO_ADVANTAGE_AT_2K`: under the corrected full-method screen, symmetric PhyTCA ($\mu=0.01$) still forgets more than sequential FT (absolute forgetting 1.803 vs. 0.630), so the current configuration does not provide a basic advantage signal. A stability-coefficient grid search on `continual_dev` over $[0, 10^{-5}, 10^{-4}, 10^{-3}, 10^{-2}]$ selected $\mu=0.01$ as the best PhyTCA setting, but it still does not beat sequential FT. The paired recheck confirms that PhyTCA with and without stability loss share an identical Task-1 trajectory by construction. All methods use the same canonical base checkpoint per seed and the same batch order; held-out data is split into `continual_dev` (for reporting and $\mu$ tuning) and `final_test` (frozen). Do not scale to the 5k×3-seed stage until a clear advantage is demonstrated.
-
-### Diagnostic redesign (D1–D6)
-
-After the NO-GO, run the diagnostic experiments to locate the failure mode before scaling:
-
-```bash
-python scripts/run_phase0_diagnostics.py --device cuda
-```
-
-The diagnostic script writes `reports/phase0_b_screening/diagnostic_experiments.json` and prints gates. It trains a single shared OPT parent checkpoint once and loads it into D4–D6 so that Task-2 differences reflect the correction module, not the parent initialization. The most recent run produced:
-
-- `DIAGNOSIS_ADAPTER_ON_RANDOM_BACKBONE`
-- `DIAGNOSIS_SEQUENTIAL_OPTIMIZATION_FAILURE`
-- `GO_TO_FIDELITY_RESIDUAL_PHYTCA`
-
-Key results (2k/seed 42, `continual_dev`):
-
-| Experiment | T1@T1 | T1@T2 | T2 final | abs forgetting | avg final nMAE | incr. params |
-|---|---|---|---|---|---|---|
-| D1 Full joint | 0.339 | 0.339 | 0.248 | 0.000 | 0.294 | 0 |
-| D2 Joint PhyTCA (symmetric) | 0.471 | 0.471 | 0.357 | 0.000 | 0.414 | 0 |
-| D3 Sequential PhyTCA (symmetric) | 1.406 | 2.511 | 2.106 | 1.105 | 2.309 | 165 |
-| D4 Frozen OPT + affine MBJ | 0.881 | 0.881 | 0.835 | 0.000 | 0.858 | 8,450 |
-| D5 Frozen OPT + residual MBJ | 0.881 | 0.881 | 0.838 | 0.000 | 0.859 | 4,225 |
-| D6 FR-PhyTCA | 0.881 | 0.881 | 0.446 | 0.000 | 0.664 | 3,923 |
-
-The architecture gap (D2–D1) is 0.120 nMAE (41% relative), so the low-rank adapter has non-negligible capacity limitations on a random backbone. D3 already fails on Task 1 (T1@T1 = 1.406), so the failure is better described as sequential optimization failure than pure Task-2 interference. Preserving the OPT route eliminates forgetting: D4, D5, and D6 share the exact same T1@T1 (0.881), prediction hash, and state-dict hash from the common OPT parent, and D6 reports $\max|\hat y_{\mathrm{OPT}}^{\mathrm{after}} - \hat y_{\mathrm{OPT}}^{\mathrm{before}}| = 0.00$. FR-PhyTCA (D6) closes most of the sequential gap while using only ~4k incremental parameters. Distillation across $\lambda \in \{0, 0.1, 1.0, 10.0\}$ leaves performance unchanged, as expected when the parent route is truly frozen.
-
-Run the diagnostic and replay unit tests with the rest of the suite:
-
-```bash
-python -m pytest tests/ -v
-```
-
-The next step after the diagnostic GO gate is the **2k×3-seed reproducibility stage** (seeds 42, 43, 44). Across seeds, FR-PhyTCA achieves an average final nMAE of 0.603 ± 0.004, the frozen-OPT correction baselines average 0.832 ± 0.036, and sequential symmetric PhyTCA averages 1.961 ± 0.269. Parent-route invariance holds exactly (T1@T1 spread within each seed is 0.00, OPT-route drift is 0.00 for every D6 variant, forgetting is identically zero).
-
-After the 2k stage passed, we ran **Stage 2: 5k×3-seed scaling validation** on Protocol B (train_cap=5000/task). All frozen-parent methods share one trained OPT parent per seed. FR-PhyTCA achieves an average final nMAE of 0.590 ± 0.026 and a Task-2 nMAE of 0.342 ± 0.022, more than 10% lower than the parameter-matched MLP (0.829 ± 0.033) and low-rank (0.831 ± 0.017) residuals, while using 3,923 incremental parameters. Raw MAE improves from 0.912 ± 0.009 eV (2k) to 0.900 ± 0.040 eV (5k), the gap to Joint Tucker (0.390 ± 0.017) stays within 0.25 nMAE, and OPT-route drift is 0.00 on every seed. The Stage-2 gate is `GO_TO_REALISTIC_FIDELITY_SCALING`.
-
-Run the Stage-2 scaling study with:
-
-```bash
-python scripts/run_phase2_b_scaling.py \
-  --train-cap 5000 --val-cap 500 --test-cap 1000 \
-  --seeds 42 43 44 --epochs 10 --patience 3 --batch-size 32 \
-  --hidden-dim 64 --adapter-rank 8 --device cuda
-```
+2. **Remaining work**
+   - Implement a full three-axis benchmark runner with realistic JARVIS data sizes and natural class imbalance.
+   - Implement the Pareto evaluation harness (calibration, latency, checkpoint size, top-k recall, forward transfer).
+   - Compare against proper baselines on the versioned protocol.
+   - Rewrite the paper around backward-compatible model serving, the impossibility theorem, and the three-axis benchmark.
 
 ## Avoid
 
 - Adding tensor-property protocols or MP data without explicit approval.
 - Modifying the periodic graph builder without updating `tests/test_periodic_graph.py`.
-- Changing FR-PhyTCA v1 design (adapter rank, residual placement, distillation coefficient, hidden dim, freezing policy) without explicit approval; the design is frozen after Stage 2.
 - Using the `llm` conda environment; always prefer `EGNN`.
