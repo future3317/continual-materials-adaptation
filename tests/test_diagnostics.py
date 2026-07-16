@@ -51,17 +51,18 @@ def _make_tiny_batch(
 
 
 def test_single_child_tucker_matches_lora_aba():
-    """Single-child Tucker and LoRA-ABA are functionally equivalent."""
+    """Single-child Tucker is now a semantic alias for LoRA-ABA."""
     d_in, d_out, rank = 8, 8, 4
     tucker = SingleChildTuckerAdapter(d_in, d_out, rank)
     lora_aba = LoRAABAAdapter(d_in, d_out, rank)
     # Copy parameters so the two adapters compute the same map.
     lora_aba.u_in.data = tucker.u_in.data.clone()
-    lora_aba.middle.data = tucker.core.data.clone()
+    lora_aba.middle.data = tucker.middle.data.clone()
     lora_aba.u_out.data = tucker.u_out.data.clone()
 
     x = torch.randn(3, d_in)
     assert torch.allclose(tucker(x), lora_aba(x), atol=1e-6)
+    assert isinstance(tucker, LoRAABAAdapter)
 
 
 def test_adapter_registry_has_baselines():

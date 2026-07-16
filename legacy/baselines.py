@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 
 from data import JARVISCrystalDataset, collate_crystals
-from phytca import PhyTCAModel, compute_mad, normalized_mae
+from legacy.phytca import PhyTCAModel, compute_mad, normalized_mae
 from train_phytca import _name_to_id, continual_experiment, evaluate_loader
 
 

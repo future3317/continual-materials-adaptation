@@ -184,7 +184,6 @@ def test_protocol_a_a1_frozen_after_a2():
         epochs=1,
         batch_size=4,
         lr=1e-3,
-        mu=0.0,
         adapter_rank=4,
         num_nearest_neighbors=4,
     )
@@ -194,7 +193,7 @@ def test_protocol_a_a1_frozen_after_a2():
     key = f"p{p_form}_f{f_opt}"
 
     assert not any(par.requires_grad for par in model.heads[key].parameters())
-    assert (p_form, f_opt) in model.layers[0].adapter.frozen_slices
+    assert model.is_frozen(p_form, f_opt)
 
 
 def test_protocol_b_different_fidelity_embeddings():
