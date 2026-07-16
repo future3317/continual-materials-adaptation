@@ -199,6 +199,143 @@ def _evaluate_all_seen(
     return nmaes
 
 
+def _train_one_task_trainable(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    forward_extra_args: tuple,
+    device: torch.device,
+    epochs: int = 20,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    patience: int = 5,
+) -> tuple[float, torch.Tensor, torch.Tensor, float]:
+    """Generic single-task training using only currently trainable parameters.
+
+    ``forward_extra_args`` is passed to ``model.forward`` after the standard
+    5-tuple and before targets; e.g. ``(prop_id, fid_id)`` or
+    ``(version_id, prop_id, fid_id)``.
+    """
+    trainable = (
+        model.current_trainable_parameters()
+        if hasattr(model, "current_trainable_parameters")
+        else [p for p in model.parameters() if p.requires_grad]
+    )
+    if not trainable:
+        raise RuntimeError("No trainable parameters for this task")
+
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    all_targets = []
+    for _, _, _, _, y in train_loader:
+        all_targets.append(y)
+    all_targets = torch.cat(all_targets)
+    target_mean = all_targets.mean()
+    target_std = all_targets.std().clamp_min(1e-6)
+    mad = compute_mad(all_targets)
+
+    best_nmae = float("inf")
+    best_state = None
+    patience_counter = 0
+
+    for _ in range(epochs):
+        model.train()
+        for node_feats, coords, mask, original_mask, y in train_loader:
+            node_feats = node_feats.to(device)
+            coords = coords.to(device)
+            mask = mask.to(device)
+            original_mask = original_mask.to(device)
+            y_norm = ((y.to(device) - target_mean) / target_std).float()
+
+            optimizer.zero_grad()
+            pred = model(node_feats, coords, mask, original_mask, *forward_extra_args)
+            loss = F.mse_loss(pred, y_norm)
+            loss.backward()
+            optimizer.step()
+
+        val_nmae = _evaluate_loader(
+            model, val_loader, forward_extra_args, target_mean, target_std, mad, device
+        )
+        if val_nmae != val_nmae:  # NaN: empty validation set, keep training.
+            continue
+        if val_nmae < best_nmae:
+            best_nmae = val_nmae
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        scheduler.step()
+        if patience_counter >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+    return best_nmae, target_mean, target_std, mad
+
+
+def _evaluate_loader(
+    model: nn.Module,
+    loader: DataLoader,
+    forward_extra_args: tuple,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    mad: float,
+    device: torch.device,
+) -> float:
+    """Evaluate nMAE on a loader for a given forward signature."""
+    model.eval()
+    preds, targets = [], []
+    with torch.no_grad():
+        for node_feats, coords, mask, original_mask, y in loader:
+            node_feats = node_feats.to(device)
+            coords = coords.to(device)
+            mask = mask.to(device)
+            original_mask = original_mask.to(device)
+            pred_norm = model(node_feats, coords, mask, original_mask, *forward_extra_args)
+            pred = pred_norm * target_std.to(device) + target_mean.to(device)
+            preds.append(pred.cpu())
+            targets.append(y)
+    if not preds:
+        return float("nan")
+    preds = torch.cat(preds)
+    targets = torch.cat(targets)
+    return float(normalized_mae(preds, targets, mad))
+
+
+def _evaluate_all_seen_versioned(
+    model: nn.Module,
+    tasks: list[tuple[str, str, str, str]],
+    task_records: list[list[dict]],
+    task_stats: list[tuple[torch.Tensor, torch.Tensor, float]],
+    prop2id: dict[str, int],
+    fid2id: dict[str, int],
+    batch_size: int,
+    device: torch.device,
+    t: int,
+) -> list[float]:
+    """Evaluate versioned model on test sets of tasks 0..t."""
+    nmaes: list[float] = []
+    for prev_t in range(t + 1):
+        version, prop, fid, _ = tasks[prev_t]
+        pid = prop2id[prop]
+        pfid = fid2id[fid]
+        mean_p, std_p, mad_p = task_stats[prev_t]
+        test_ds = JARVISCrystalDataset(task_records[prev_t], split="test")
+        test_ds.target_mean = float(mean_p)
+        test_ds.target_std = float(std_p)
+        test_ds.normalize_target = True
+        loader = DataLoader(
+            test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_crystals
+        )
+        nmaes.append(
+            _evaluate_loader(model, loader, (version, pid, pfid), mean_p, std_p, mad_p, device)
+        )
+    return nmaes
+
+
 class LoRALinear(nn.Module):
     """Simple LoRA-augmented linear layer used by legacy screening scripts."""
 

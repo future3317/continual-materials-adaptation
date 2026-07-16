@@ -61,7 +61,7 @@ Frozen encoder plus shared low-rank bases `U_in`, `U_out`. Each versioned endpoi
 Run core tests with:
 
 ```bash
-python -m pytest tests/test_versioned_graph.py tests/test_adapters_models.py tests/test_global_splits.py tests/test_fidelity_graph.py -v
+python -m pytest tests/test_versioned_graph.py tests/test_versioned_runner.py tests/test_adapters_models.py tests/test_global_splits.py tests/test_fidelity_graph.py -v
 ```
 
 `tests/test_versioned_graph.py` covers:
@@ -69,9 +69,19 @@ python -m pytest tests/test_versioned_graph.py tests/test_adapters_models.py tes
 - the impossibility sanity check without version IDs,
 - incremental parameter accounting.
 
+`tests/test_versioned_runner.py` covers the end-to-end `scripts/run_versioned_protocol.py` runner on capped JARVIS data.
+
 `tests/test_global_splits.py` covers canonical material-group splits and cross-year leakage prevention.
 
 ## Training
+
+Versioned-endpoint training:
+
+```bash
+python scripts/run_versioned_protocol.py --snapshots dft_3d_2021 dft_3d --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --epochs 15 --device cuda
+```
+
+For smoke tests, add `--cap 50` to limit per-split records.
 
 Legacy task-incremental training:
 
@@ -79,7 +89,7 @@ Legacy task-incremental training:
 python train_phytca.py --protocol a --hidden-dim 64 --adapter-rank 8 --epochs 20 --device cuda
 ```
 
-Versioned-endpoint training is currently exercised through `versioned_graph.py` and the unit tests. A full three-axis benchmark runner and Pareto evaluation harness are the next implementation steps.
+`scripts/run_versioned_protocol.py` consumes `data.build_versioned_protocol(...)`, trains each `(version, property, fidelity)` route, publishes it, and evaluates all published endpoints. Metrics are written to `reports/versioned_protocol/metrics.json`.
 
 ## Baselines and Phase 0 comparison
 
@@ -103,12 +113,12 @@ Metrics must include: latest-task MAE, per-endpoint drift, forward/backward tran
    - Added `data.TARGET_FIELDS` and `data.build_versioned_protocol` for three-axis tasks.
    - Implemented `versioned_graph.VersionedFidelityGraph` with exact retention by structural isolation.
    - Added formal impossibility statement and unit tests.
+   - Implemented `scripts/run_versioned_protocol.py`, the first end-to-end three-axis benchmark runner.
    - Verified `data_audit.py --protocol a/b` still pass and selected unit tests pass.
 
 2. **Remaining work**
-   - Implement a full three-axis benchmark runner with realistic JARVIS data sizes and natural class imbalance.
    - Implement the Pareto evaluation harness (calibration, latency, checkpoint size, top-k recall, forward transfer).
-   - Compare against proper baselines on the versioned protocol.
+   - Compare against proper baselines on the versioned protocol (independent, joint, copy-on-write, LoRA-AB/ABA, replay).
    - Rewrite the paper around backward-compatible model serving, the impossibility theorem, and the three-axis benchmark.
 
 ## Avoid

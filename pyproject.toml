@@ -65,3 +65,8 @@ py-modules = [
     "versioned_graph",
 ]
 packages = ["legacy"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that load real JARVIS data or train models",
+]
