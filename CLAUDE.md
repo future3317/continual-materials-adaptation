@@ -4,9 +4,9 @@
 
 This repository studies **backward-compatible model serving** for evolving materials databases. The core observation is that exact retention of an old prediction endpoint and continual learning of new labels for the same `(material, property, fidelity)` are fundamentally incompatible when no version identifier is provided at inference: a single deterministic function cannot output two different values for the same input. The project therefore formalizes the problem as serving a set of **versioned endpoints**. Each endpoint is identified by `(version, property, fidelity)`. Old endpoints are frozen after publication; the latest endpoint is allowed to learn revised data and new fidelities.
 
-The repository contains both (1) an initial task-incremental FR-PhyTCA implementation (`diagnostics.py`, `train_phytca.py`) and (2) a new `VersionedFidelityGraph` (`versioned_graph.py`) that implements structural exact retention for published endpoints via shared low-rank bases and route-private coefficients.
+The current architecture is the **Persistent Consolidation Graph (PCG)**, implemented in `persistent_consolidation_graph.py`. PCG uses a frozen backbone (MatGL by default), an append-only shared basis bank, route-private coefficients, and typed parent edges (temporal revision, fidelity transfer). New endpoints first learn through a temporary fast adapter, then project that knowledge onto the basis bank; when the residual is too novel, new basis blocks are appended. Old blocks are never modified, so every published endpoint is structurally immutable.
 
-The symmetric **PhyTCA** baseline and the old Phase-0 baselines have been moved to `legacy/`; they are retained only for reference and should not be used in new work.
+The symmetric **PhyTCA** baseline and the old Phase-0 baselines, plus the older `VersionedFidelityGraph`, have been moved to or replaced by code in `legacy/`; they are retained only for reference and should not be used in new work.
 
 ## Problem statement (formal)
 
@@ -19,13 +19,13 @@ This motivates the versioned-endpoint design: inference must specify which publi
 ## Environment
 
 - Activate the `EGNN` conda environment before running Python commands: `source activate EGNN` (bash) or `conda activate EGNN` (cmd).
-- Required packages: `torch`, `egnn-pytorch`, `pymatgen`, `jarvis-tools`, `numpy`, `pytest`.
+- Required packages: `torch`, `egnn-pytorch`, `pymatgen`, `jarvis-tools`, `numpy`, `pytest`, `matgl` (for the MatGL backbone).
 
 ## Code conventions
 
 - Python 3.11+ with `from __future__ import annotations`.
 - Prefer explicit type hints.
-- Keep modules flat and focused: `data.py` for data, `models.py`/`versioned_graph.py` for the new architecture, `train_utils.py` for shared training utilities, `diagnostics.py` for experiments, `data_audit.py` for audits.
+- Keep modules flat and focused: `data.py` for data, `persistent_consolidation_graph.py` for the PCG architecture, `protocols.py` for protocol builders, `pcg_runner.py` for shared runner utilities, `train_utils.py` for shared training utilities, `diagnostics.py` for experiments, `data_audit.py` for audits.
 - Legacy code lives in `legacy/` and should not be imported by new modules.
 - Default to no comments; only explain non-obvious invariants.
 
@@ -35,63 +35,76 @@ This motivates the versioned-endpoint design: inference must specify which publi
 2. Use `data.load_jarvis_dataset(name)` which loads directly from zip and falls back to `jarvis-tools`.
 3. Target fields are defined in `data.TARGET_FIELDS` and include band gap (OptB88vdW, TB-mBJ, HSE), formation energy, bulk modulus, shear modulus, and dielectric tensor components.
 4. Run `python data_audit.py --protocol {a,b}` to produce manifests, reports, and the GO/NO-GO gate for the legacy Protocol A/B benchmarks.
-5. Use `data.build_versioned_protocol(...)` to construct three-axis `(version, property, fidelity)` tasks with canonical material-group splits.
+5. Use `protocols.build_combined_protocol(...)`, `build_revision_protocol(...)`, `build_addition_protocol(...)`, or `build_fidelity_expansion_protocol(...)` to construct three-axis `(version, property, fidelity)` tasks with canonical material-group splits.
 6. Training uses `JARVISCrystalDataset` and `collate_crystals`, which return a 5-tuple: `(node_feats, coords, mask, original_mask, targets)`. The model must pool using `original_mask` only.
 
 ## Protocols
 
 - **Protocol A** — database evolution across JARVIS 2021/2022 for formation energy and band gap (OptB88vdW). A1↔A2 and A3↔A4 are data-incremental: they share property/fidelity embeddings, adapter route, and head. The route is frozen only after its final occurrence. *Limitation:* because the same `(property, fidelity)` route is reused across snapshots, exact retention cannot hold when a target value is revised.
 - **Protocol B** — multi-fidelity band gap: OptB88vdW → TB-mBJ across both JARVIS versions, with paired records sharing splits.
-- **Versioned Protocol** — the new three-axis benchmark built by `data.build_versioned_protocol`. Each `(version, property, fidelity)` combination is a distinct endpoint, so 2021 OPT and 2022 OPT are separate routes and exact retention of the 2021 endpoint is well defined.
+- **PCG protocols** — three-axis `(version, property, fidelity)` benchmarks built by `protocols.py`. Each combination is a distinct endpoint, so 2021 OPT and 2022 OPT are separate routes and exact retention of the 2021 endpoint is well defined. The combined protocol interleaves fidelities within each version.
 
 Do not introduce Materials Project data or tensor properties unless explicitly requested.
 
 ## Architecture
 
-### `models.ContinualCrystalModel`
+### `persistent_consolidation_graph.PersistentConsolidationGraph`
 
-Frozen crystal-graph encoder with per-task adapter banks and heads. Exact retention by structural isolation: old tasks are frozen via `requires_grad=False` and excluded from the child optimizer.
+Frozen backbone (MatGL or EGNN) plus an append-only `BasisBank` of low-rank `(U_in, U_out)` blocks. Each endpoint owns a `RouteSpec` with parent IDs, selected basis block IDs, private middle matrices `M_e`, a head, and a normalizer. `publish_route(...)` freezes the route's coefficients and its basis blocks, guaranteeing exact retention. New routes may reuse existing blocks or trigger novelty-gated expansion. Incremental parameter count per endpoint: $\sum_k r_k^2 + (d+1)$ for the private coefficients/head plus $2 d \sum_k r_k$ when new basis blocks are appended.
 
-### `versioned_graph.VersionedFidelityGraph`
+### `models.CrystalEncoder`
 
-Frozen encoder plus shared low-rank bases `U_in`, `U_out`. Each versioned endpoint owns a private middle matrix `M_r` and a head. `publish_route(...)` freezes the route's coefficients and the shared bases, guaranteeing exact retention. New routes add new `M_r` matrices on top of the frozen bases. Incremental parameter count per endpoint: $L r^2 + (d+1)$.
+Small EGNN-based encoder used for fast smoke tests and diagnostics. The main experiments use `backbones.MatGLBackbone`.
 
 ### `models.CopyOnWriteFullChildModel`
 
-Each versioned endpoint owns a deep copy of the full crystal encoder and a private head. This is the strongest exact-retention baseline (no cross-route interference) but pays a full encoder per endpoint. New children are initialized by copying the most recently trained child and then unfreezing the copy.
+Each versioned endpoint owns a deep copy of the full crystal encoder and a private head. This is the strongest exact-retention baseline (no cross-route interference) but pays a full encoder per endpoint.
 
 ## Testing
 
-Run core tests with:
+Run core PCG tests with:
 
 ```bash
-python -m pytest tests/test_versioned_graph.py tests/test_versioned_runner.py tests/test_adapters_models.py tests/test_global_splits.py tests/test_fidelity_graph.py -v
+python -m pytest tests/test_persistent_consolidation_graph.py tests/test_pcg_matgl.py tests/test_protocols.py tests/test_snapshot_diff.py tests/test_pcg_revision_runner.py tests/test_pcg_addition_runner.py tests/test_pcg_fidelity_runner.py tests/test_pcg_baselines.py -v
 ```
 
-`tests/test_versioned_graph.py` covers:
-- exact retention of published endpoints under training of new routes,
-- the impossibility sanity check without version IDs,
-- incremental parameter accounting.
+`tests/test_persistent_consolidation_graph.py` covers:
+- append-only isolation of old routes under training of new routes,
+- endpoint registry hash detection,
+- typed parent gates with physical-unit aggregation,
+- zero forgetting after publication.
 
-`tests/test_versioned_runner.py` covers the end-to-end `scripts/run_versioned_protocol.py` runner on capped JARVIS data.
+`tests/test_pcg_matgl.py` covers MatGL-backbone + PCG smoke tests.
 
-`tests/test_global_splits.py` covers canonical material-group splits and cross-year leakage prevention.
+`tests/test_protocols.py` and `tests/test_snapshot_diff.py` cover protocol builders and snapshot diff classification.
+
+`tests/test_pcg_baselines.py` covers all comparison methods on a tiny capped protocol.
 
 ## Training
 
-Versioned-endpoint training:
+Combined PCG benchmark:
 
 ```bash
-python scripts/run_versioned_protocol.py --snapshots dft_3d_2021 dft_3d --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --epochs 15 --device cuda
+python -m scripts.run_pcg_combined --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --epochs-fast 5 --epochs-cons 15 --device cuda
 ```
 
-Versioned baseline comparison:
+Single-axis protocols:
 
 ```bash
-python scripts/run_versioned_baselines.py --snapshots dft_3d_2021 dft_3d --properties band_gap --fidelities OptB88vdW TB-mBJ --methods versioned_graph copy_on_write continual_tucker continual_lora_aba joint independent --epochs 15 --device cuda
+python -m scripts.run_pcg_revision --properties band_gap --fidelities OptB88vdW --hidden-dim 64 --rank 8 --device cuda
+python -m scripts.run_pcg_addition --properties band_gap --fidelities OptB88vdW --hidden-dim 64 --rank 8 --device cuda
+python -m scripts.run_pcg_fidelity_expansion --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --device cuda
 ```
 
-For smoke tests, add `--cap 50` to limit per-split records.
+Baseline comparison:
+
+```bash
+python -m scripts.run_pcg_baselines --properties band_gap --fidelities OptB88vdW TB-mBJ --hidden-dim 64 --rank 8 --device cuda
+```
+
+The harness automatically skips methods whose `reports/pcg_baselines/<method>/metrics.json` already exists, so re-running the same command resumes from the last incomplete method.
+
+For smoke tests, add `--cap 50` and use `--encoder-type egnn` for faster CPU execution.
 
 Legacy task-incremental training:
 
@@ -99,38 +112,37 @@ Legacy task-incremental training:
 python train_phytca.py --protocol a --hidden-dim 64 --adapter-rank 8 --epochs 20 --device cuda
 ```
 
-`scripts/run_versioned_protocol.py` consumes `data.build_versioned_protocol(...)`, trains each `(version, property, fidelity)` route, publishes it, and evaluates all published endpoints. Metrics are written to `reports/versioned_protocol/metrics.json`.
+`scripts/run_pcg_combined.py` consumes `protocols.build_combined_protocol(...)`, trains each `(version, property, fidelity)` route with typed parents, publishes it, and evaluates all published endpoints. Metrics are written to `reports/pcg_combined/metrics.json`.
 
 ## Baselines and Phase 0 comparison
 
 Old baselines (joint, independent, sequential, EWC, replay, LoRA variants, symmetric PhyTCA) have been moved to `legacy/baselines.py` and `legacy/phytca.py`. They are no longer part of the recommended workflow.
 
-The new evaluation will compare:
+The new evaluation compares:
 - Independent models per endpoint (upper bound on accuracy, no sharing),
 - Joint model on all endpoints (upper bound, no exact retention),
-- `VersionedFidelityGraph` with published frozen routes,
+- `PersistentConsolidationGraph` with novelty-gated expandable basis,
 - Copy-on-write full child models,
-- Standard LoRA-AB and LoRA-ABA adapters,
+- Fixed shared-basis and always-expand ablations,
 - Replay / distillation / functional regularization for the same-fidelity revision case.
 
-Metrics must include: latest-task MAE, per-endpoint drift, forward/backward transfer, calibration error, parameter count, checkpoint size, inference latency, and top-k recall.
+Metrics must include: latest-task MAE, per-endpoint drift, forward/backward transfer, calibration error, parameter count, basis growth, checkpoint size, inference latency, and top-k recall.
 
 ## Status and next steps
 
-1. **Done in this refactor**
-   - Moved `phytca.py` and `baselines.py` to `legacy/`.
-   - Extracted shared training utilities into `train_utils.py`.
-   - Added `data.TARGET_FIELDS` and `data.build_versioned_protocol` for three-axis tasks.
-   - Implemented `versioned_graph.VersionedFidelityGraph` with exact retention by structural isolation.
-   - Added formal impossibility statement and unit tests.
-   - Implemented `scripts/run_versioned_protocol.py`, the first end-to-end three-axis benchmark runner.
-   - Added `models.CopyOnWriteFullChildModel` and `scripts/run_versioned_baselines.py` for versioned-protocol baseline comparison.
-   - Verified `data_audit.py --protocol a/b` still pass and selected unit tests pass.
+1. **Done**
+   - Snapshot diff foundation (`snapshot_diff.py`) and protocol builders (`protocols.py`).
+   - Persistent Consolidation Graph core (`persistent_consolidation_graph.py`) with append-only basis bank, fast adapter, novelty gate, and typed parent edges.
+   - MatGL backbone integration (`tests/test_pcg_matgl.py`, `pcg_runner.py`).
+   - Protocol-specific runners (`scripts/run_pcg_combined.py`, `run_pcg_revision.py`, `run_pcg_addition.py`, `run_pcg_fidelity_expansion.py`).
+   - Pareto harness extended with physical-target forward kwargs.
 
-2. **Remaining work**
-   - Implement the Pareto evaluation harness (calibration, latency, checkpoint size, top-k recall, forward transfer).
-   - Add replay / distillation baselines for same-fidelity revision.
-   - Rewrite the paper around backward-compatible model serving, the impossibility theorem, and the three-axis benchmark.
+2. **Done**
+   - Cap-500 baseline comparison (`scripts/run_pcg_baselines.py --cap 500`) completed and filled `tab:baselines` in `main.tex`.
+
+3. **Remaining work**
+   - Full-scale (no-cap) experiments for the camera-ready tables.
+   - Finalize Pareto metrics and paper figures.
 
 ## Avoid
 
