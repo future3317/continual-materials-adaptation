@@ -78,10 +78,12 @@ class LatencyMeter:
         loader: torch.utils.data.DataLoader,
         device: torch.device,
         forward_args: tuple = (),
+        forward_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, float]:
         """Return mean and std of per-batch latency in milliseconds."""
         model.eval()
         latencies: list[float] = []
+        forward_kwargs = forward_kwargs or {}
 
         for batch in loader:
             node_feats, coords, mask, original_mask, _ = batch
@@ -93,7 +95,7 @@ class LatencyMeter:
 
             # Warm-up
             for _ in range(self.warmup):
-                _ = model(*args)
+                _ = model(*args, **forward_kwargs)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
 
@@ -102,7 +104,7 @@ class LatencyMeter:
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 start = time.perf_counter()
-                _ = model(*args)
+                _ = model(*args, **forward_kwargs)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 latencies.append((time.perf_counter() - start) * 1000.0)
@@ -144,8 +146,10 @@ class FLOPCounter:
         loader: torch.utils.data.DataLoader,
         device: torch.device,
         forward_args: tuple = (),
+        forward_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Return estimated forward FLOPs for one batch."""
+        forward_kwargs = forward_kwargs or {}
         handles: list[Any] = []
         for m in model.modules():
             if isinstance(m, nn.Linear):
@@ -160,7 +164,7 @@ class FLOPCounter:
                 coords = coords.to(device)
                 mask = mask.to(device)
                 original_mask = original_mask.to(device)
-                _ = model(node_feats, coords, mask, original_mask, *forward_args)
+                _ = model(node_feats, coords, mask, original_mask, *forward_args, **forward_kwargs)
                 break
 
         for h in handles:
@@ -208,18 +212,13 @@ def evaluate_pareto_metrics(
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     forward_args: tuple = (),
+    forward_kwargs: dict[str, Any] | None = None,
     n_bins: int = 10,
     latency_warmup: int = 3,
     latency_repeats: int = 10,
 ) -> dict[str, float]:
-    """Compute a bundle of accuracy/cost metrics for one endpoint.
-
-    Returns dict with keys:
-      - calibration_ece, calibration_max_cal_error
-      - latency_ms_mean, latency_ms_std
-      - estimated_flops
-      - checkpoint_total_bytes
-    """
+    """Compute a bundle of accuracy/cost metrics for one endpoint."""
+    forward_kwargs = forward_kwargs or {}
     model.eval()
     preds, targets = [], []
     with torch.no_grad():
@@ -228,7 +227,7 @@ def evaluate_pareto_metrics(
             coords = coords.to(device)
             mask = mask.to(device)
             original_mask = original_mask.to(device)
-            pred = model(node_feats, coords, mask, original_mask, *forward_args)
+            pred = model(node_feats, coords, mask, original_mask, *forward_args, **forward_kwargs)
             preds.append(pred.cpu())
             targets.append(y)
     preds_t = torch.cat(preds)
@@ -236,9 +235,9 @@ def evaluate_pareto_metrics(
 
     cal_metrics = CalibrationError(n_bins=n_bins)(preds_t, targets_t)
     latency_metrics = LatencyMeter(warmup=latency_warmup, repeats=latency_repeats).measure(
-        model, loader, device, forward_args
+        model, loader, device, forward_args, forward_kwargs
     )
-    flops = FLOPCounter().count_model(model, loader, device, forward_args)
+    flops = FLOPCounter().count_model(model, loader, device, forward_args, forward_kwargs)
     checkpoint_metrics = CheckpointSize()(model, optimizer)
 
     return {
