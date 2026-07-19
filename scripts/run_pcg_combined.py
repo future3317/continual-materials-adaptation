@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--encoder-type", choices=["matgl", "egnn"], default="matgl")
+    parser.add_argument("--matgl-model", default=None, help="Pre-trained MatGL model name/path; None uses a small random-init M3GNet")
     parser.add_argument("--epochs-fast", type=int, default=5)
     parser.add_argument("--epochs-cons", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -54,7 +55,7 @@ def main() -> None:
     )
 
     encoder, graph_builder = build_pcg_encoder_and_graph_builder(
-        args.encoder_type, args.hidden_dim
+        args.encoder_type, args.hidden_dim, matgl_model=args.matgl_model
     )
     task_records = [filter_records_for_encoder(recs, args.encoder_type, encoder) for recs in task_records]
 
@@ -67,7 +68,7 @@ def main() -> None:
     prop2id = _name_to_id([p for _, p, _, _ in tasks])
     fid2id = _name_to_id([f for _, _, f, _ in tasks])
 
-    model = PersistentConsolidationGraph(encoder, args.hidden_dim, rank=args.rank).to(device)
+    model = PersistentConsolidationGraph(encoder, args.hidden_dim, rank=args.rank, max_rank=args.rank).to(device)
 
     metrics = run_pcg_protocol(
         protocol_name="combined",

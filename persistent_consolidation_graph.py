@@ -69,10 +69,11 @@ class BasisBank(nn.Module):
     adapter residual, or create a private copy-on-write block.
     """
 
-    def __init__(self, dim: int, default_rank: int = 8) -> None:
+    def __init__(self, dim: int, default_rank: int = 8, max_rank: int | None = None) -> None:
         super().__init__()
         self.dim = dim
         self.default_rank = default_rank
+        self.max_rank = max_rank
         self.blocks: nn.ModuleDict = nn.ModuleDict()
         self._block_counter = 0
 
@@ -145,6 +146,7 @@ class BasisBank(nn.Module):
         fast_update: torch.Tensor,
         novelty_threshold: float = 0.2,
         svd_energy: float = 0.9,
+        max_rank: int | None = None,
         created_by_version: str = "",
     ) -> tuple[list[str], list[str]]:
         """Decide whether to reuse existing blocks or append new ones.
@@ -155,12 +157,14 @@ class BasisBank(nn.Module):
         Returns:
             (selected_existing_block_ids, new_block_ids)
         """
+        max_rank = max_rank or self.max_rank or self.default_rank
         existing_blocks = list(self.blocks.values())
+        old_block_ids = list(self.blocks.keys())
         novelty = self.measure_novelty(fast_update, existing_blocks)
 
         if novelty <= novelty_threshold and existing_blocks:
             # Reuse all existing blocks.
-            return list(self.blocks.keys()), []
+            return old_block_ids, []
 
         # Expand: extract new basis from the residual via truncated SVD.
         if existing_blocks:
@@ -177,9 +181,11 @@ class BasisBank(nn.Module):
         energies = torch.cumsum(s**2, dim=0)
         total_energy = energies[-1].clamp_min(1e-12)
         rank = int((energies / total_energy >= svd_energy).nonzero(as_tuple=True)[0][0].item()) + 1
+        rank = min(rank, max_rank)
 
-        u_in_new = vh[:rank].T  # (dim, rank)
-        u_out_new = u_out_new[:, :rank]  # (dim, rank)
+        sqrt_s = torch.sqrt(s[:rank])
+        u_in_new = u_out_new[:, :rank] * sqrt_s  # U * sqrt(S)
+        u_out_new = vh[:rank].T * sqrt_s  # V * sqrt(S)
 
         new_block_id = self.add_block(
             u_in=u_in_new,
@@ -188,7 +194,7 @@ class BasisBank(nn.Module):
             created_by_version=created_by_version,
             plastic=True,
         )
-        return list(self.blocks.keys()), [new_block_id]
+        return old_block_ids, [new_block_id]
 
     def orthogonality_loss(self, new_block_ids: Sequence[str]) -> torch.Tensor:
         """Penalty encouraging new blocks to be orthogonal to old ones."""
@@ -235,7 +241,7 @@ class BasisBank(nn.Module):
             u_out = torch.stack([b.u_out for b in blocks], dim=0)  # (G, dim, rank)
             m = torch.stack([coefficients[bid] for bid in bids], dim=0)  # (G, rank, rank)
             h = torch.einsum("...d,gdr->...gr", x, u_in)
-            h = torch.einsum("...gr,grr->...gr", h, m)
+            h = torch.einsum("...gi,gij->...gj", h, m)
             out = out + torch.einsum("...gr,gdr->...d", h, u_out)
         return out
 
@@ -369,17 +375,23 @@ class PersistentConsolidationGraph(nn.Module):
         encoder: nn.Module,
         hidden_dim: int,
         rank: int = 8,
+        max_rank: int | None = None,
         novelty_threshold: float = 0.2,
         svd_energy: float = 0.9,
     ) -> None:
         super().__init__()
         self.encoder = encoder
+        # PCG requires the backbone to be frozen so that published endpoints remain
+        # structurally invariant under later training.
+        for p in self.encoder.parameters():
+            p.requires_grad = False
         self.hidden_dim = hidden_dim
         self.rank = rank
+        self.max_rank = max_rank
         self.novelty_threshold = novelty_threshold
         self.svd_energy = svd_energy
 
-        self.basis_bank = BasisBank(hidden_dim, default_rank=rank)
+        self.basis_bank = BasisBank(hidden_dim, default_rank=rank, max_rank=max_rank)
         self.registry = EndpointRegistry()
         self._route_order: list[str] = []
 
@@ -438,31 +450,23 @@ class PersistentConsolidationGraph(nn.Module):
         epochs_fast: int = 10,
         epochs_cons: int = 15,
         lr: float = 1e-3,
-        beta: float = 1.0,
+        beta: float = 1e-2,
         gamma: float = 1e-3,
     ) -> dict[str, Any]:
         """Two-stage endpoint learning: fast adapter then consolidation.
 
-        Loaders are expected to return *physical* targets; normalization to the
-        endpoint's own coordinate system happens inside the model.
+        Loaders return physical targets; training losses are computed in the
+        endpoint's normalized coordinate system, matching the paper's algorithm.
         """
         key = self._endpoint_key(version, prop_id, fid_id)
         route = self.registry.routes[key]
         mean_e, std_e = route.normalizer
 
-        # Fast stage: train temporary adapter + the route head on the residual
-        # target after accounting for parent predictions.
-        fast = FastAdapter(self.hidden_dim, self.rank).to(device)
-        route.to(device)
-        trainable_fast = list(fast.parameters()) + list(route.head.parameters())
-        if route.parent_gate is not None:
-            trainable_fast += list(route.parent_gate.parameters())
         # Pre-compute encoder features once; the backbone is frozen.
         train_features = self._precompute_features(train_loader, device)
         val_features = self._precompute_features(val_loader, device)
 
-        # Fast stage: train temporary adapter + the route head on the residual
-        # target after accounting for parent predictions.
+        # Fast stage: train temporary adapter + route head on normalized targets.
         fast = FastAdapter(self.hidden_dim, self.rank).to(device)
         route.to(device)
         trainable_fast = list(fast.parameters()) + list(route.head.parameters())
@@ -476,8 +480,9 @@ class PersistentConsolidationGraph(nn.Module):
                 route.parent_gate.train()
             for h, original_mask, y_phys in train_features:
                 optimizer_fast.zero_grad()
-                pred_phys = self._forward_with_adapter_h(h, original_mask, key, fast, physical=True)
-                loss = F.mse_loss(pred_phys, y_phys)
+                pred_norm = self._forward_with_adapter_h(h, original_mask, key, fast, physical=False)
+                y_norm = (y_phys - mean_e) / std_e
+                loss = F.mse_loss(pred_norm, y_norm)
                 loss.backward()
                 optimizer_fast.step()
 
@@ -487,6 +492,7 @@ class PersistentConsolidationGraph(nn.Module):
             fast_update,
             novelty_threshold=self.novelty_threshold,
             svd_energy=self.svd_energy,
+            max_rank=self.max_rank,
             created_by_version=version,
         )
 
@@ -514,17 +520,18 @@ class PersistentConsolidationGraph(nn.Module):
             for h, original_mask, y_phys in train_features:
                 optimizer_cons.zero_grad()
 
-                pred_fast = self._forward_with_adapter_h(h, original_mask, key, fast, physical=True).detach()
-                pred_persistent = self._forward_route_h(h, original_mask, key, physical=True)
+                pred_fast_norm = self._forward_with_adapter_h(h, original_mask, key, fast, physical=False).detach()
+                pred_persistent_norm = self._forward_route_h(h, original_mask, key, physical=False)
+                y_norm = (y_phys - mean_e) / std_e
 
-                loss_task = F.mse_loss(pred_persistent, y_phys)
-                loss_distill = F.mse_loss(pred_persistent, pred_fast)
+                loss_task = F.mse_loss(pred_persistent_norm, y_norm)
+                loss_distill = F.mse_loss(pred_persistent_norm, pred_fast_norm)
                 loss_orth = self.basis_bank.orthogonality_loss(new_ids) if new_ids else torch.tensor(0.0, device=device)
                 loss = loss_task + beta * loss_distill + gamma * loss_orth
                 loss.backward()
                 optimizer_cons.step()
 
-            val_loss = self._eval_loss(val_features, key, physical=True)
+            val_loss = self._eval_loss(val_features, key, physical=False)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
@@ -605,11 +612,12 @@ class PersistentConsolidationGraph(nn.Module):
         """Route forward given pre-computed encoder features ``h``."""
         route = self.registry.routes[endpoint_id]
         coeffs = {bid: route.private_coefficients[bid] for bid in route.basis_block_ids}
+        # Parent predictions use the original backbone features, not the child residual.
+        parent_pred_phys = self._parent_predictions_h(h, original_mask, endpoint_id, physical=True)
         h = h + self.basis_bank(h, route.basis_block_ids, coeffs)
         pooled = self._pool(h, original_mask)
         residual_phys = route.head(pooled).squeeze(-1)
 
-        parent_pred_phys = self._parent_predictions_h(h, original_mask, endpoint_id, physical=True)
         pred_phys = parent_pred_phys + residual_phys
 
         if physical:
@@ -627,11 +635,12 @@ class PersistentConsolidationGraph(nn.Module):
     ) -> torch.Tensor:
         """Fast-adapter forward given pre-computed encoder features ``h``."""
         route = self.registry.routes[endpoint_id]
+        # Parent predictions use the original backbone features, not the fast adapter residual.
+        parent_pred_phys = self._parent_predictions_h(h, original_mask, endpoint_id, physical=True)
         h = h + adapter(h)
         pooled = self._pool(h, original_mask)
         residual_phys = route.head(pooled).squeeze(-1)
 
-        parent_pred_phys = self._parent_predictions_h(h, original_mask, endpoint_id, physical=True)
         pred_phys = parent_pred_phys + residual_phys
 
         if physical:

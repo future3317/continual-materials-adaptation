@@ -221,7 +221,7 @@ def assign_global_splits(
         formulas.add(r["formula"])
 
     rng = np.random.default_rng(seed)
-    formulas_list = list(formulas)
+    formulas_list = sorted(formulas)
     rng.shuffle(formulas_list)
 
     n = len(formulas_list)
@@ -399,7 +399,7 @@ def _assign_splits(
 ) -> list[dict]:
     """Assign formula-disjoint train/val/test splits to records in place."""
     rng = np.random.default_rng(seed)
-    formulas = list({r["formula"] for r in records})
+    formulas = sorted({r["formula"] for r in records})
     rng.shuffle(formulas)
 
     n = len(formulas)
@@ -815,7 +815,7 @@ def formula_disjoint_split(
     for recs in task_record_lists:
         all_formulas.update(r.get("formula", "") for r in recs)
     all_formulas.discard("")
-    formulas = np.array(list(all_formulas))
+    formulas = np.array(sorted(all_formulas))
     rng.shuffle(formulas)
 
     owner_for_formula = {

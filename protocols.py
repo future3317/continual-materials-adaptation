@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Sequence
 
 from data import TARGET_FIELDS, assign_global_splits, load_jarvis_dataset
-from snapshot_diff import classify_records
+from snapshot_diff import build_jid_index, classify_records
 
 
 def _records_for_property_fidelity(
@@ -68,9 +68,10 @@ def build_revision_protocol(
     target_fields = [TARGET_FIELDS[(p, f)] for p in properties for f in fidelities if (p, f) in TARGET_FIELDS]
     summary, annotated_next, _ = classify_records(d21, d22, target_fields)
 
-    retained_jids = {r["jid"] for r in annotated_next if r["change_type"] != "added"}
-    retained_21 = [r for r in d21 if r.get("jid") in retained_jids]
-    retained_22 = [r for r in d22 if r.get("jid") in retained_jids]
+    prev_by_jid = build_jid_index(d21)
+    retained_annotated = [r for r in annotated_next if r["change_type"] != "added"]
+    retained_21 = [prev_by_jid[r["matched_prev_jid"]] for r in retained_annotated]
+    retained_22 = retained_annotated
 
     tasks: list[tuple[str, str, str, str]] = []
     task_records: list[list[dict]] = []
@@ -244,31 +245,81 @@ def build_combined_protocol(
     """Build the combined three-axis protocol used for the main benchmark.
 
     The canonical order is:
-      1. 2021 low fidelity
-      2. 2021 high fidelity
-      3. 2022 low fidelity  (with parent edges to 2022 revision and 2021 high fidelity)
-      4. 2022 high fidelity
+      1. 2021 low fidelity  (all 2021 materials)
+      2. 2021 high fidelity (fidelity expansion on 2021 materials)
+      3. 2022 low fidelity  (materials added in 2022)
+      4. 2022 high fidelity (fidelity expansion on added 2022 materials)
+
+    This interleaves fidelities within each version and covers the addition axis
+    via the 2022 endpoints, which are trained only on materials that did not
+    appear in the 2021 snapshot.
     """
-    tasks, task_records, audit = build_revision_protocol(
-        properties=properties,
-        fidelities=fidelities,
-        cache_dir=cache_dir,
-        seed=seed,
-        n_train_val_per_task=n_train_val_per_task,
-    )
+    d21 = load_jarvis_dataset("dft_3d_2021", cache_dir)
+    d22 = load_jarvis_dataset("dft_3d", cache_dir)
 
-    # Reorder to interleave fidelities within each version.
-    ordered_tasks: list[tuple[str, str, str, str]] = []
-    ordered_records: list[list[dict]] = []
-    version_order = ["dft_3d_2021", "dft_3d"]
-    for version in version_order:
+    target_fields = [TARGET_FIELDS[(p, f)] for p in properties for f in fidelities if (p, f) in TARGET_FIELDS]
+    summary, annotated_next, _ = classify_records(d21, d22, target_fields, skip_structure_match=True)
+
+    added_jids = {r["jid"] for r in annotated_next if r["change_type"] == "added"}
+    added_22 = [r for r in d22 if r.get("jid") in added_jids]
+
+    tasks: list[tuple[str, str, str, str]] = []
+    task_records: list[list[dict]] = []
+
+    for prop in properties:
+        recs_2021_by_fid: dict[str, list[dict]] = {}
+        recs_added_by_fid: dict[str, list[dict]] = {}
+
         for fid in fidelities:
-            for prop in properties:
-                for i, (v, p, f, tf) in enumerate(tasks):
-                    if v == version and p == prop and f == fid:
-                        ordered_tasks.append((v, p, f, tf))
-                        ordered_records.append(task_records[i])
-                        break
+            target_field = TARGET_FIELDS.get((prop, fid))
+            if target_field is None:
+                continue
+            recs_2021_by_fid[fid] = _records_for_property_fidelity(
+                d21, prop, fid, target_field, "dft_3d_2021"
+            )
+            recs_added_by_fid[fid] = _records_for_property_fidelity(
+                added_22, prop, fid, target_field, "dft_3d"
+            )
 
-    audit["protocol"] = "combined"
-    return ordered_tasks, ordered_records, audit
+        if len(recs_2021_by_fid) < 2 or len(recs_added_by_fid) < 2:
+            continue
+
+        # Keep only records that have both fidelities within each version.
+        common_2021_jids = None
+        for recs in recs_2021_by_fid.values():
+            jids = {r["jid"] for r in recs}
+            common_2021_jids = jids if common_2021_jids is None else common_2021_jids & jids
+        common_added_jids = None
+        for recs in recs_added_by_fid.values():
+            jids = {r["jid"] for r in recs}
+            common_added_jids = jids if common_added_jids is None else common_added_jids & jids
+
+        filtered_2021: dict[str, list[dict]] = {}
+        filtered_added: dict[str, list[dict]] = {}
+        for fid in fidelities:
+            if fid not in recs_2021_by_fid:
+                continue
+            filtered_2021[fid] = [r for r in recs_2021_by_fid[fid] if r["jid"] in common_2021_jids]
+            filtered_added[fid] = [r for r in recs_added_by_fid[fid] if r["jid"] in common_added_jids]
+
+        all_recs = [r for recs in filtered_2021.values() for r in recs]
+        all_recs += [r for recs in filtered_added.values() for r in recs]
+        assign_global_splits(all_recs, seed=seed)
+
+        for version, recs_by_fid in [("dft_3d_2021", filtered_2021), ("dft_3d", filtered_added)]:
+            for fid in fidelities:
+                if fid not in recs_by_fid:
+                    continue
+                target_field = TARGET_FIELDS[(prop, fid)]
+                recs = recs_by_fid[fid]
+                if n_train_val_per_task is not None:
+                    recs = recs[:n_train_val_per_task]
+                tasks.append((version, prop, fid, target_field))
+                task_records.append(recs)
+
+    audit = {
+        "protocol": "combined",
+        "summary": summary,
+        "n_tasks": len(tasks),
+    }
+    return tasks, task_records, audit

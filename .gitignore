@@ -45,5 +45,18 @@ Thumbs.db
 egnn-pytorch-main/
 matgl-main/
 
+# Agent/AI tool configuration directories
+.agents/
+.claude/
+.codex/
+
+# Local notes and scratch files
+新设计.md
+\!
+OF
+
+# LaTeX / build logs
+texput.log
+
 # Artifact directory
 Continual Learning/

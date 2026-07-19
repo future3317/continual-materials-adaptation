@@ -523,6 +523,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--encoder-type", choices=["matgl", "egnn"], default="matgl")
+    parser.add_argument("--matgl-model", default=None, help="Pre-trained MatGL model name/path; None uses a small random-init M3GNet for smoke tests")
     parser.add_argument("--epochs-fast", type=int, default=5)
     parser.add_argument("--epochs-cons", type=int, default=10)
     parser.add_argument("--epochs-baseline", type=int, default=20, help="Epochs for non-PCG baselines")
@@ -563,7 +564,7 @@ def main() -> None:
         seed=args.seed,
     )
 
-    encoder, graph_builder = build_pcg_encoder_and_graph_builder(args.encoder_type, args.hidden_dim)
+    encoder, graph_builder = build_pcg_encoder_and_graph_builder(args.encoder_type, args.hidden_dim, matgl_model=args.matgl_model)
     task_records = [filter_records_for_encoder(recs, args.encoder_type, encoder) for recs in task_records]
 
     if args.cap is not None:
@@ -581,6 +582,9 @@ def main() -> None:
 
     for method in args.methods:
         print(f"\n{'='*60}\nRunning {method}\n{'='*60}")
+        # Reset RNG before each method so all methods see the same initialization
+        # and data order for a fair paired comparison.
+        torch.manual_seed(args.seed)
         method_dir = args.output_dir / method
         method_dir.mkdir(parents=True, exist_ok=True)
         method_path = method_dir / "metrics.json"
@@ -615,7 +619,7 @@ def main() -> None:
             )
         else:
             # Re-instantiate a fresh encoder for each non-PCG method.
-            fresh_encoder, _ = build_pcg_encoder_and_graph_builder(args.encoder_type, args.hidden_dim)
+            fresh_encoder, _ = build_pcg_encoder_and_graph_builder(args.encoder_type, args.hidden_dim, matgl_model=args.matgl_model)
             metrics = run_simple_baseline(
                 tasks=tasks,
                 task_records=task_records,

@@ -50,11 +50,11 @@ Do not introduce Materials Project data or tensor properties unless explicitly r
 
 ### `persistent_consolidation_graph.PersistentConsolidationGraph`
 
-Frozen backbone (MatGL or EGNN) plus an append-only `BasisBank` of low-rank `(U_in, U_out)` blocks. Each endpoint owns a `RouteSpec` with parent IDs, selected basis block IDs, private middle matrices `M_e`, a head, and a normalizer. `publish_route(...)` freezes the route's coefficients and its basis blocks, guaranteeing exact retention. New routes may reuse existing blocks or trigger novelty-gated expansion. Incremental parameter count per endpoint: $\sum_k r_k^2 + (d+1)$ for the private coefficients/head plus $2 d \sum_k r_k$ when new basis blocks are appended.
+Frozen backbone (MatGL or EGNN) plus an append-only `BasisBank` of low-rank `(U_in, U_out)` blocks. Each endpoint owns a `RouteSpec` with parent IDs, selected basis block IDs, private middle matrices `M_e`, a head, and a normalizer. `publish_route(...)` freezes the route's coefficients and its basis blocks, guaranteeing exact retention. New routes may reuse existing blocks or trigger novelty-gated expansion. Incremental parameter count per endpoint: $\sum_k r_k^2 + (d+1)$ for the private coefficients/head plus $2 d \sum_k r_k$ when new basis blocks are appended; when routes reuse all existing blocks the total route-parameter count grows quadratically in the number of blocks unless a per-route block cap is enforced.
 
 ### `models.CrystalEncoder`
 
-Small EGNN-based encoder used for fast smoke tests and diagnostics. The main experiments use `backbones.MatGLBackbone`.
+Small EGNN-based encoder used for fast smoke tests and diagnostics. The main experiments use `backbones.MatGLBackbone` with a frozen, randomly initialized M3GNet architecture; pass `--matgl-model <name>` to load a pre-trained MatGL checkpoint.
 
 ### `models.CopyOnWriteFullChildModel`
 

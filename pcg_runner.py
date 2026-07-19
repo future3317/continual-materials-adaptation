@@ -20,6 +20,7 @@ def build_pcg_encoder_and_graph_builder(
     encoder_type: str,
     hidden_dim: int,
     node_dim: int = 92,
+    matgl_model: str | None = None,
 ) -> tuple[torch.nn.Module, Any | None]:
     """Create a frozen PCG encoder and optional graph builder for real data."""
     if encoder_type == "matgl":
@@ -27,7 +28,7 @@ def build_pcg_encoder_and_graph_builder(
 
         if not _MATGL_AVAILABLE:
             raise ImportError("MatGL is not installed; use --encoder-type egnn")
-        encoder = build_matgl_backbone(None, hidden_dim=hidden_dim, freeze=True)
+        encoder = build_matgl_backbone(matgl_model, hidden_dim=hidden_dim, freeze=True)
         node_feature_dim = encoder._max_element_z
         graph_builder = PeriodicGraphBuilder(node_feature_dim=node_feature_dim)
         return encoder, graph_builder
@@ -54,16 +55,15 @@ def filter_records_for_encoder(
 
 
 def cap_records(recs: list[dict], cap: int | None) -> list[dict]:
-    """Cap records while preserving train/val/test split membership."""
-    if cap is None or len(recs) <= cap:
+    """Cap each split to ``cap`` records while preserving split membership."""
+    if cap is None:
         return recs
     by_split: dict[str, list[dict]] = {}
     for r in recs:
         by_split.setdefault(r.get("split", "train"), []).append(r)
     capped: list[dict] = []
-    per_split_cap = max(1, cap // len(by_split))
     for split_recs in by_split.values():
-        capped.extend(split_recs[:per_split_cap])
+        capped.extend(split_recs[:cap])
     return capped
 
 
